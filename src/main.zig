@@ -12,7 +12,13 @@ pub fn main(init: std.process.Init) !void {
     // Accessing command line arguments:
     const args = try init.minimal.args.toSlice(arena);
 
-    var vm = machine.VM.init();
+    // Program output goes to real stdout so it can be piped and redirected,
+    // separately from the std.log diagnostics on stderr.
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
+    defer stdout.interface.flush() catch {};
+
+    var vm = machine.VM.init(&stdout.interface);
     defer vm.deinit();
     std.log.info("VM initialized successfully.", .{});
 
@@ -37,9 +43,12 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("============= VM OUTPUT =============", .{});
 
     vm.run() catch |err| {
+        // Flush first so partial program output precedes the error on stderr.
+        stdout.interface.flush() catch {};
         std.log.err("VM execution failed: {s}", .{@errorName(err)});
         return err;
     };
+    try stdout.interface.flush();
 
     std.log.info("============= END OF OUTPUT =============", .{});
     std.log.info("VM execution completed successfully.", .{});

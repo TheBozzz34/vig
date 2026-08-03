@@ -44,4 +44,6 @@ pub const OpCode = enum(u8) {
     ret = 23,
     foreign_call = 24,
     print_string = 25,
+    load_at = 26,
+    store_at = 27,
 };
