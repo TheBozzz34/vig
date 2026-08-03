@@ -156,12 +156,12 @@ pub fn run(self: *VM) !void {
                 self.sp -= 1;
                 self.stack[self.sp - 1] = @rem(a, b);
             },
-            .eq => try utils.binaryComparison(self, utils.compareEq),
-            .ne => try utils.binaryComparison(self, utils.compareNe),
-            .lt => try utils.binaryComparison(self, utils.compareLt),
-            .lte => try utils.binaryComparison(self, utils.compareLte),
-            .gt => try utils.binaryComparison(self, utils.compareGt),
-            .gte => try utils.binaryComparison(self, utils.compareGte),
+            .eq => try utils.binaryComparison(self, utils.comparisons.eq),
+            .ne => try utils.binaryComparison(self, utils.comparisons.ne),
+            .lt => try utils.binaryComparison(self, utils.comparisons.lt),
+            .lte => try utils.binaryComparison(self, utils.comparisons.lte),
+            .gt => try utils.binaryComparison(self, utils.comparisons.gt),
+            .gte => try utils.binaryComparison(self, utils.comparisons.gte),
         }
     }
 }

@@ -50,26 +50,28 @@ pub fn binaryComparison(
     self.stack[self.sp - 1] = if (compare(a, b)) 1 else 0;
 }
 
-pub fn compareEq(a: i32, b: i32) bool {
-    return a == b;
-}
+pub const comparisons = struct {
+    pub fn eq(a: i32, b: i32) bool {
+        return a == b;
+    }
 
-pub fn compareNe(a: i32, b: i32) bool {
-    return a != b;
-}
+    pub fn ne(a: i32, b: i32) bool {
+        return a != b;
+    }
 
-pub fn compareLt(a: i32, b: i32) bool {
-    return a < b;
-}
+    pub fn lt(a: i32, b: i32) bool {
+        return a < b;
+    }
 
-pub fn compareLte(a: i32, b: i32) bool {
-    return a <= b;
-}
+    pub fn lte(a: i32, b: i32) bool {
+        return a <= b;
+    }
 
-pub fn compareGt(a: i32, b: i32) bool {
-    return a > b;
-}
+    pub fn gt(a: i32, b: i32) bool {
+        return a > b;
+    }
 
-pub fn compareGte(a: i32, b: i32) bool {
-    return a >= b;
-}
+    pub fn gte(a: i32, b: i32) bool {
+        return a >= b;
+    }
+};
