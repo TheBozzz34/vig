@@ -59,8 +59,10 @@ pub fn resolve(library_name: []const u8, symbol_name: []const u8, arg_types: []c
     @memcpy(symbol_z[0..symbol_name.len], symbol_name);
     symbol_z[symbol_name.len] = 0;
 
-    const address = GetProcAddress(library, symbol_z[0..symbol_name.len :0].ptr) orelse
+    const address = GetProcAddress(library, symbol_z[0..symbol_name.len :0].ptr) orelse {
+        std.debug.print("Foreign symbol not found: {s}!{s}\n", .{ library_name, symbol_name });
         return error.ForeignSymbolNotFound;
+    };
 
     var types: [constants.max_foreign_args]ArgType = @splat(.u32);
     @memcpy(types[0..arg_types.len], arg_types);
