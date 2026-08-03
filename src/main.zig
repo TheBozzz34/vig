@@ -53,4 +53,6 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("VM execution failed: {s}", .{@errorName(err)});
         return err;
     };
+
+    std.log.info("VM execution completed successfully.", .{});
 }
