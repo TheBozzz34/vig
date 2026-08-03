@@ -4,14 +4,14 @@ const utils = @import("utils.zig");
 
 pub const VM = struct {
     // memory and stack, arrays of bytes and ints
-    memory: []u8,
-    stack: [256]i32,
+    memory: [constants.memory_size]u8,
+    stack: [constants.stack_size]i32,
 
     // data segment for load and store ops
-    data: []i32,
+    data: [constants.data_size]i32,
 
     // data segment for call and return ops
-    call_stack: []usize,
+    call_stack: [constants.call_stack_size]usize,
     csp: usize,
 
     // Number of bytes occupied by the currently loaded program. Memory after this point is not executable code.
@@ -21,13 +21,24 @@ pub const VM = struct {
     ip: usize = 0, // Instruction Pointer
     sp: usize = 0, // Stack Pointer
 
-    pub fn init(allocator: std.mem.Allocator, memory_size: usize) !VM {
-        const mem = try allocator.alloc(u8, memory_size);
-        // Zero out the allocated memory to ensure a clean state
-        @memset(mem, 0);
-        return VM{
-            .memory = mem,
+    pub fn reset(self: *VM) void {
+        @memset(&self.stack, 0);
+        @memset(&self.data, 0);
+        @memset(&self.call_stack, 0);
+
+        self.program_len = 0;
+        self.ip = 0;
+        self.sp = 0;
+        self.csp = 0;
+    }
+
+    pub fn init() VM {
+        return .{
+            .memory = @splat(0),
             .stack = @splat(0),
+            .data = @splat(0),
+            .call_stack = @splat(0),
+            .csp = 0,
             .program_len = 0,
             .sp = 0,
             .ip = 0,
@@ -35,239 +46,244 @@ pub const VM = struct {
     }
 
     pub fn loadProgram(self: *VM, program: []const u8) !void {
-        if (program.len > self.memory.len) return error.ProgramTooLarge;
+        if (program.len > self.memory.len) {
+            return error.ProgramTooLarge;
+        }
 
-        // Clear the old program and any stale bytes before copying the new one.
-        @memset(self.memory, 0);
+        self.reset();
+
         @memcpy(self.memory[0..program.len], program);
-
         self.program_len = program.len;
-        self.ip = 0;
-        self.sp = 0;
-        self.stack = @splat(0);
     }
 
-    // free the allocated memory when the VM is no longer needed
-    pub fn deinit(self: *VM, allocator: std.mem.Allocator) void {
-        allocator.free(self.memory);
-        self.memory = undefined;
-        self.program_len = 0;
-    }
-};
+    pub fn run(self: *VM) !void {
+        while (self.ip < self.program_len) {
+            // Fetch the next instruction
+            const raw_op = self.memory[self.ip];
 
-pub fn run(self: *VM) !void {
-    while (self.ip < self.program_len) {
-        // Fetch the next instruction
-        const raw_op = self.memory[self.ip];
+            // Decode the instruction into an enum
+            const op = utils.intToEnum(raw_op) catch {
+                std.debug.print("Invalid OpCode: {x}\n", .{raw_op});
+                return error.InvalidInstruction;
+            };
+            self.ip += 1;
 
-        // Decode the instruction into an enum
-        const op = utils.intToEnum(raw_op) catch {
-            std.debug.print("Invalid OpCode: {x}\n", .{raw_op});
-            return error.InvalidInstruction;
-        };
-        self.ip += 1;
+            // switch on enum
+            switch (op) {
+                .halt => return,
 
-        // switch on enum
-        switch (op) {
-            .halt => return,
+                .push => {
+                    // Fetch next 4 bytes as an i32 operand
+                    if (self.program_len - self.ip < 4) return error.SegmentFault;
+                    const value = std.mem.readInt(i32, self.memory[self.ip..][0..4], .little);
+                    self.ip += 4;
 
-            .push => {
-                // Fetch next 4 bytes as an i32 operand
-                if (self.program_len - self.ip < 4) return error.SegmentFault;
-                const value = std.mem.readInt(i32, self.memory[self.ip..][0..4], .little);
-                self.ip += 4;
+                    if (self.sp >= self.stack.len) return error.StackOverflow;
 
-                if (self.sp >= self.stack.len) return error.StackOverflow;
+                    self.stack[self.sp] = value;
+                    self.sp += 1;
+                },
 
-                self.stack[self.sp] = value;
-                self.sp += 1;
-            },
+                .add => {
+                    if (self.sp < 2) return error.StackUnderflow;
 
-            .add => {
-                if (self.sp < 2) return error.StackUnderflow;
-                const b = self.stack[self.sp - 1];
-                const a = self.stack[self.sp - 2];
-                self.sp -= 1; // Pop b, replace a with result
+                    const b = self.stack[self.sp - 1];
+                    const a = self.stack[self.sp - 2];
+                    const result = @addWithOverflow(a, b);
 
-                // Catch overflow explicitly using Zig primitives
-                self.stack[self.sp - 1] = @addWithOverflow(a, b)[0];
-            },
+                    if (result[1] != 0) return error.IntegerOverflow;
 
-            .sub => {
-                if (self.sp < 2) return error.StackUnderflow;
-                const b = self.stack[self.sp - 1];
-                const a = self.stack[self.sp - 2];
-                self.sp -= 1;
-                self.stack[self.sp - 1] = @subWithOverflow(a, b)[0];
-            },
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = result[0];
+                },
 
-            .print => {
-                if (self.sp == 0) return error.StackUnderflow;
-                std.debug.print("{d}\n", .{self.stack[self.sp - 1]});
-            },
+                .sub => {
+                    if (self.sp < 2) return error.StackUnderflow;
 
-            .dup => {
-                if (self.sp == 0) return error.StackUnderflow;
-                if (self.sp >= self.stack.len) return error.StackOverflow;
+                    const b = self.stack[self.sp - 1];
+                    const a = self.stack[self.sp - 2];
+                    const result = @subWithOverflow(a, b);
 
-                self.stack[self.sp] = self.stack[self.sp - 1];
-                self.sp += 1;
-            },
-            .pop => {
-                if (self.sp == 0) return error.StackUnderflow;
-                self.sp -= 1;
-            },
-            .swap => {
-                if (self.sp < 2) return error.StackUnderflow;
+                    if (result[1] != 0) return error.IntegerOverflow;
 
-                const a = self.stack[self.sp - 1];
-                self.stack[self.sp - 1] = self.stack[self.sp - 2];
-                self.stack[self.sp - 2] = a;
-            },
-            .mul => {
-                if (self.sp < 2) return error.StackUnderflow;
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = result[0];
+                },
 
-                const b = self.stack[self.sp - 1];
-                const a = self.stack[self.sp - 2];
-                const result = @mulWithOverflow(a, b);
+                .print => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    std.debug.print("{d}\n", .{self.stack[self.sp - 1]});
+                },
 
-                if (result[1] != 0) return error.IntegerOverflow;
+                .dup => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    if (self.sp >= self.stack.len) return error.StackOverflow;
 
-                self.sp -= 1;
-                self.stack[self.sp - 1] = result[0];
-            },
-            .div => {
-                if (self.sp < 2) return error.StackUnderflow;
+                    self.stack[self.sp] = self.stack[self.sp - 1];
+                    self.sp += 1;
+                },
+                .pop => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    self.sp -= 1;
+                },
+                .swap => {
+                    if (self.sp < 2) return error.StackUnderflow;
 
-                const b = self.stack[self.sp - 1];
-                const a = self.stack[self.sp - 2];
+                    const a = self.stack[self.sp - 1];
+                    self.stack[self.sp - 1] = self.stack[self.sp - 2];
+                    self.stack[self.sp - 2] = a;
+                },
+                .mul => {
+                    if (self.sp < 2) return error.StackUnderflow;
 
-                if (b == 0) return error.DivisionByZero;
+                    const b = self.stack[self.sp - 1];
+                    const a = self.stack[self.sp - 2];
+                    const result = @mulWithOverflow(a, b);
 
-                // minInt / -1 cannot fit in i32.
-                if (a == std.math.minInt(i32) and b == -1) {
-                    return error.IntegerOverflow;
-                }
+                    if (result[1] != 0) return error.IntegerOverflow;
 
-                self.sp -= 1;
-                self.stack[self.sp - 1] = @divTrunc(a, b);
-            },
-            .mod => {
-                if (self.sp < 2) return error.StackUnderflow;
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = result[0];
+                },
+                .div => {
+                    if (self.sp < 2) return error.StackUnderflow;
 
-                const b = self.stack[self.sp - 1];
-                const a = self.stack[self.sp - 2];
+                    const b = self.stack[self.sp - 1];
+                    const a = self.stack[self.sp - 2];
 
-                if (b == 0) return error.DivisionByZero;
+                    if (b == 0) return error.DivisionByZero;
 
-                self.sp -= 1;
-                self.stack[self.sp - 1] = @rem(a, b);
-            },
-            .eq => try utils.binaryComparison(self, utils.comparisons.eq),
-            .ne => try utils.binaryComparison(self, utils.comparisons.ne),
-            .lt => try utils.binaryComparison(self, utils.comparisons.lt),
-            .lte => try utils.binaryComparison(self, utils.comparisons.lte),
-            .gt => try utils.binaryComparison(self, utils.comparisons.gt),
-            .gte => try utils.binaryComparison(self, utils.comparisons.gte),
-            .jmp => {
-                const target = try utils.readU32(self);
+                    // minInt / -1 cannot fit in i32.
+                    if (a == std.math.minInt(i32) and b == -1) {
+                        return error.IntegerOverflow;
+                    }
 
-                if (target >= self.memory.len) {
-                    return error.SegmentFault;
-                }
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = @divTrunc(a, b);
+                },
+                .mod => {
+                    if (self.sp < 2) return error.StackUnderflow;
 
-                self.ip = target;
-            },
-            .jmp_zero => {
-                const target = try utils.readU32(self);
+                    const b = self.stack[self.sp - 1];
+                    const a = self.stack[self.sp - 2];
 
-                if (target >= self.memory.len) {
-                    return error.SegmentFault;
-                }
+                    if (b == 0) return error.DivisionByZero;
 
-                if (self.sp == 0) {
-                    return error.StackUnderflow;
-                }
+                    if (a == std.math.minInt(i32) and b == -1) {
+                        return error.IntegerOverflow;
+                    }
 
-                self.sp -= 1;
-                const condition = self.stack[self.sp];
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = @rem(a, b);
+                },
+                .eq => try utils.binaryComparison(self, utils.comparisons.eq),
+                .ne => try utils.binaryComparison(self, utils.comparisons.ne),
+                .lt => try utils.binaryComparison(self, utils.comparisons.lt),
+                .lte => try utils.binaryComparison(self, utils.comparisons.lte),
+                .gt => try utils.binaryComparison(self, utils.comparisons.gt),
+                .gte => try utils.binaryComparison(self, utils.comparisons.gte),
+                .jmp => {
+                    const target = try utils.readU32(self);
 
-                if (condition == 0) {
+                    if (target >= self.program_len) {
+                        return error.SegmentFault;
+                    }
+
                     self.ip = target;
-                }
-            },
-            .jmp_not_zero => {
-                const target = try utils.readU32(self);
+                },
+                .jmp_zero => {
+                    const target = try utils.readU32(self);
 
-                if (target >= self.memory.len) {
-                    return error.SegmentFault;
-                }
+                    if (target >= self.program_len) {
+                        return error.SegmentFault;
+                    }
 
-                if (self.sp == 0) {
-                    return error.StackUnderflow;
-                }
+                    if (self.sp == 0) {
+                        return error.StackUnderflow;
+                    }
 
-                self.sp -= 1;
-                const condition = self.stack[self.sp];
+                    self.sp -= 1;
+                    const condition = self.stack[self.sp];
 
-                if (condition != 0) {
+                    if (condition == 0) {
+                        self.ip = target;
+                    }
+                },
+                .jmp_not_zero => {
+                    const target = try utils.readU32(self);
+
+                    if (target >= self.program_len) {
+                        return error.SegmentFault;
+                    }
+
+                    if (self.sp == 0) {
+                        return error.StackUnderflow;
+                    }
+
+                    self.sp -= 1;
+                    const condition = self.stack[self.sp];
+
+                    if (condition != 0) {
+                        self.ip = target;
+                    }
+                },
+                .load => {
+                    const raw_address = try utils.readU32(self);
+                    const address: usize = @intCast(raw_address);
+
+                    if (address >= self.data.len) {
+                        return error.SegmentFault;
+                    }
+
+                    if (self.sp >= self.stack.len) {
+                        return error.StackOverflow;
+                    }
+
+                    self.stack[self.sp] = self.data[address];
+                    self.sp += 1;
+                },
+                .store => {
+                    const raw_address = try utils.readU32(self);
+                    const address: usize = @intCast(raw_address);
+
+                    if (address >= self.data.len) {
+                        return error.SegmentFault;
+                    }
+
+                    if (self.sp == 0) {
+                        return error.StackUnderflow;
+                    }
+
+                    self.sp -= 1;
+                    self.data[address] = self.stack[self.sp];
+                },
+                .call => {
+                    const target = try utils.readU32(self);
+
+                    if (target >= self.program_len) {
+                        return error.SegmentFault;
+                    }
+
+                    if (self.csp >= self.call_stack.len) {
+                        return error.CallStackOverflow;
+                    }
+
+                    self.call_stack[self.csp] = self.ip;
+                    self.csp += 1;
                     self.ip = target;
-                }
-            },
-            .load => {
-                const address = try utils.readU32(self);
+                },
+                .ret => {
+                    if (self.csp == 0) {
+                        return error.CallStackUnderflow;
+                    }
 
-                if (address >= self.data.len) {
-                    return error.SegmentFault;
-                }
-
-                if (self.sp >= self.stack.len) {
-                    return error.StackOverflow;
-                }
-
-                self.stack[self.sp] = self.data[address];
-                self.sp += 1;
-            },
-            .store => {
-                const address = try utils.readU32(self);
-
-                if (address >= self.data.len) {
-                    return error.SegmentFault;
-                }
-
-                if (self.sp == 0) {
-                    return error.StackUnderflow;
-                }
-
-                self.sp -= 1;
-                self.data[address] = self.stack[self.sp];
-            },
-            .call => {
-                const target = try utils.readU32(self);
-
-                if (target >= self.memory.len) {
-                    return error.SegmentFault;
-                }
-
-                if (self.csp >= self.call_stack.len) {
-                    return error.CallStackOverflow;
-                }
-
-                self.call_stack[self.csp] = self.ip;
-                self.csp += 1;
-                self.ip = target;
-            },
-            .ret => {
-                if (self.csp == 0) {
-                    return error.CallStackUnderflow;
-                }
-
-                self.csp -= 1;
-                self.ip = self.call_stack[self.csp];
-            },
+                    self.csp -= 1;
+                    self.ip = self.call_stack[self.csp];
+                },
+            }
         }
     }
-}
+};
 
 test "execution stops at the loaded program boundary" {
     var vm = try VM.init(std.testing.allocator, 8);
@@ -286,7 +302,7 @@ test "execution stops at the loaded program boundary" {
     // total memory size instead of program_len.
     vm.memory[program.len] = 0xff;
 
-    try run(&vm);
+    try vm.run();
     try std.testing.expectEqual(program.len, vm.program_len);
     try std.testing.expectEqual(@as(usize, 1), vm.sp);
 }

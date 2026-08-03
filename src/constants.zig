@@ -1,3 +1,8 @@
+pub const memory_size = 4096;
+pub const stack_size = 256;
+pub const data_size = 256;
+pub const call_stack_size = 128;
+
 pub const OpCode = enum(u8) {
     halt = 0,
     push = 1,

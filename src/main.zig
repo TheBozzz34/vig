@@ -17,15 +17,7 @@ pub fn main(init: std.process.Init) !void {
         std.log.info("arg: {s}", .{arg});
     }
 
-    std.log.info("Init VM", .{});
-
-    var vm: machine.VM = machine.VM.init(arena, vm_memory_size) catch |err| {
-        std.log.err("Failed to initialize VM: {s}", .{@errorName(err)});
-        return err;
-    };
-
-    defer vm.deinit(arena);
-
+    var vm = machine.VM.init();
     std.log.info("VM initialized successfully.", .{});
 
     if (args.len > 2) {
@@ -48,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("Loaded {d} program bytes.", .{vm.program_len});
     std.log.info("Running VM", .{});
 
-    machine.run(&vm) catch |err| {
+    vm.run() catch |err| {
         std.log.err("VM execution failed: {s}", .{@errorName(err)});
         return err;
     };

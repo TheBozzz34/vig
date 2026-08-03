@@ -84,7 +84,7 @@ pub const comparisons = struct {
 };
 
 pub fn readU32(self: *machine.VM) !u32 {
-    if (self.ip + 4 > self.memory.len) {
+    if (self.ip > self.program_len or self.program_len - self.ip < 4) {
         return error.SegmentFault;
     }
 
