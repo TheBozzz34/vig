@@ -13,6 +13,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     var vm = machine.VM.init();
+    defer vm.deinit();
     std.log.info("VM initialized successfully.", .{});
 
     if (args.len > 2) {

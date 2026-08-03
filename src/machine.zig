@@ -1,5 +1,6 @@
 const std = @import("std");
 const constants = @import("constants.zig");
+const foreign = @import("foreign.zig");
 const utils = @import("utils.zig");
 
 pub const VM = struct {
@@ -14,6 +15,9 @@ pub const VM = struct {
     call_stack: [constants.call_stack_size]usize,
     csp: usize,
 
+    foreign_imports: [constants.max_foreign_imports]?foreign.Import,
+    foreign_import_count: usize,
+
     // Number of bytes occupied by the currently loaded program. Memory after this point is not executable code.
     program_len: usize = 0,
 
@@ -23,6 +27,7 @@ pub const VM = struct {
 
     // reset vm state
     pub fn reset(self: *VM) void {
+        self.clearForeignImports();
         @memset(&self.stack, 0);
         @memset(&self.data, 0);
         @memset(&self.call_stack, 0);
@@ -33,6 +38,10 @@ pub const VM = struct {
         self.csp = 0;
     }
 
+    pub fn deinit(self: *VM) void {
+        self.clearForeignImports();
+    }
+
     // initialize the VM with default values
     pub fn init() VM {
         return .{
@@ -41,6 +50,8 @@ pub const VM = struct {
             .data = @splat(0),
             .call_stack = @splat(0),
             .csp = 0,
+            .foreign_imports = @splat(null),
+            .foreign_import_count = 0,
             .program_len = 0,
             .sp = 0,
             .ip = 0,
@@ -49,14 +60,14 @@ pub const VM = struct {
 
     // Load a program into the VM's memory, a program is just a sequence of bytes
     pub fn loadProgram(self: *VM, program: []const u8) !void {
-        if (program.len > self.memory.len) {
-            return error.ProgramTooLarge;
-        }
-
         self.reset();
+        errdefer self.clearForeignImports();
 
-        @memcpy(self.memory[0..program.len], program);
-        self.program_len = program.len;
+        const code = try self.loadForeignImports(program);
+        if (code.len > self.memory.len) return error.ProgramTooLarge;
+
+        @memcpy(self.memory[0..code.len], code);
+        self.program_len = code.len;
     }
 
     // loop through instructions in memory, fetch, decode, and execute them
@@ -284,14 +295,112 @@ pub const VM = struct {
                     self.csp -= 1;
                     self.ip = self.call_stack[self.csp];
                 },
+                .foreign_call => {
+                    if (self.ip >= self.program_len) return error.SegmentFault;
+                    const import_index = self.memory[self.ip];
+                    self.ip += 1;
+                    try self.callForeign(import_index);
+                },
             }
         }
+    }
+
+    fn clearForeignImports(self: *VM) void {
+        for (&self.foreign_imports) |*entry| {
+            if (entry.*) |*import| foreign.close(import);
+            entry.* = null;
+        }
+        self.foreign_import_count = 0;
+    }
+
+    fn loadForeignImports(self: *VM, program: []const u8) ![]const u8 {
+        const magic = "VIGF";
+        if (program.len < magic.len or !std.mem.eql(u8, program[0..magic.len], magic)) return program;
+        if (program.len < 6) return error.InvalidProgramHeader;
+        if (program[4] != 1) return error.UnsupportedProgramVersion;
+
+        const import_count: usize = program[5];
+        if (import_count > constants.max_foreign_imports) return error.TooManyForeignImports;
+
+        var offset: usize = 6;
+        for (0..import_count) |index| {
+            if (program.len -| offset < 3) return error.InvalidProgramHeader;
+            const library_len: usize = program[offset];
+            const symbol_len: usize = program[offset + 1];
+            const arg_count: usize = program[offset + 2];
+            offset += 3;
+
+            if (arg_count > constants.max_foreign_args or program.len -| offset < arg_count) {
+                return error.InvalidProgramHeader;
+            }
+
+            var arg_types: [constants.max_foreign_args]foreign.ArgType = @splat(.u32);
+            for (0..arg_count) |arg_index| {
+                arg_types[arg_index] = try foreign.ArgType.fromByte(program[offset + arg_index]);
+            }
+            offset += arg_count;
+
+            const names_len = library_len + symbol_len;
+            if (program.len -| offset < names_len) return error.InvalidProgramHeader;
+            const library_name = program[offset .. offset + library_len];
+            const symbol_name = program[offset + library_len .. offset + names_len];
+            offset += names_len;
+
+            self.foreign_imports[index] = try foreign.resolve(library_name, symbol_name, arg_types[0..arg_count]);
+            self.foreign_import_count += 1;
+        }
+
+        return program[offset..];
+    }
+
+    fn callForeign(self: *VM, import_index: u8) !void {
+        const index: usize = import_index;
+        if (index >= self.foreign_import_count) return error.InvalidForeignImport;
+        const import = &(self.foreign_imports[index] orelse return error.InvalidForeignImport);
+        const arg_count: usize = import.arg_count;
+        if (self.sp < arg_count) return error.StackUnderflow;
+
+        var args: [constants.max_foreign_args]usize = @splat(0);
+        var arg_index = arg_count;
+        while (arg_index > 0) {
+            arg_index -= 1;
+            self.sp -= 1;
+            args[arg_index] = try self.marshalForeignArgument(import.arg_types[arg_index], self.stack[self.sp]);
+        }
+
+        if (self.sp >= self.stack.len) return error.StackOverflow;
+        const result = foreign.invoke(import, args);
+        self.stack[self.sp] = @bitCast(@as(u32, @truncate(result)));
+        self.sp += 1;
+    }
+
+    fn marshalForeignArgument(self: *VM, arg_type: foreign.ArgType, value: i32) !usize {
+        return switch (arg_type) {
+            .i32 => @bitCast(@as(isize, value)),
+            .u32 => blk: {
+                const bits: u32 = @bitCast(value);
+                break :blk @as(usize, bits);
+            },
+            .ptr => try self.guestPointer(value, false),
+            .cstr => try self.guestPointer(value, true),
+        };
+    }
+
+    fn guestPointer(self: *VM, value: i32, require_terminator: bool) !usize {
+        if (value == 0) return 0;
+        if (value < 0) return error.InvalidGuestPointer;
+        const offset: usize = @intCast(value);
+        if (offset >= self.program_len) return error.InvalidGuestPointer;
+        if (require_terminator and std.mem.indexOfScalar(u8, self.memory[offset..self.program_len], 0) == null) {
+            return error.UnterminatedGuestString;
+        }
+        return @intFromPtr(self.memory[offset..].ptr);
     }
 };
 
 test "execution stops at the loaded program boundary" {
-    var vm = try VM.init(std.testing.allocator, 8);
-    defer vm.deinit(std.testing.allocator);
+    var vm = VM.init();
+    defer vm.deinit();
 
     const program = [_]u8{
         @intFromEnum(constants.OpCode.push),
@@ -309,4 +418,22 @@ test "execution stops at the loaded program boundary" {
     try vm.run();
     try std.testing.expectEqual(program.len, vm.program_len);
     try std.testing.expectEqual(@as(usize, 1), vm.sp);
+}
+
+test "resolves and invokes a zero-argument Windows API" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+
+    var vm = VM.init();
+    defer vm.deinit();
+
+    const program = "VIGF" ++ [_]u8{ 1, 1, 12, 19, 0 } ++
+        "kernel32.dllGetCurrentProcessId" ++ [_]u8{
+            @intFromEnum(constants.OpCode.foreign_call), 0,
+            @intFromEnum(constants.OpCode.halt),
+        };
+    try vm.loadProgram(program);
+    try vm.run();
+
+    try std.testing.expectEqual(@as(usize, 1), vm.sp);
+    try std.testing.expect(vm.stack[0] > 0);
 }

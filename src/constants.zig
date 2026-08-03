@@ -10,6 +10,12 @@ pub const data_size = 256;
 // size of the VM's call stack, used for function calls and returns
 pub const call_stack_size = 128;
 
+// Foreign functions are deliberately limited to a small, predictable ABI
+// surface.  This is enough for simple Windows APIs without exposing arbitrary
+// host pointers or callback support to VIG programs.
+pub const max_foreign_imports = 16;
+pub const max_foreign_args = 4;
+
 // All opcodes
 pub const OpCode = enum(u8) {
     halt = 0,
@@ -36,4 +42,5 @@ pub const OpCode = enum(u8) {
     store = 21,
     call = 22,
     ret = 23,
+    foreign_call = 24,
 };
