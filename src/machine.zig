@@ -163,7 +163,7 @@ pub fn run(self: *VM) !void {
             .gt => try utils.binaryComparison(self, utils.comparisons.gt),
             .gte => try utils.binaryComparison(self, utils.comparisons.gte),
             .jmp => {
-                const target = try utils.readU32();
+                const target = try utils.readU32(self);
 
                 if (target >= self.memory.len) {
                     return error.SegmentFault;
@@ -172,7 +172,7 @@ pub fn run(self: *VM) !void {
                 self.ip = target;
             },
             .jmp_zero => {
-                const target = try utils.readU32();
+                const target = try utils.readU32(self);
 
                 if (target >= self.memory.len) {
                     return error.SegmentFault;
@@ -190,7 +190,7 @@ pub fn run(self: *VM) !void {
                 }
             },
             .jmp_not_zero => {
-                const target = try utils.readU32();
+                const target = try utils.readU32(self);
 
                 if (target >= self.memory.len) {
                     return error.SegmentFault;
