@@ -32,6 +32,7 @@ pub fn intToEnum(opcode: u8) !constants.OpCode {
         22 => constants.OpCode.call,
         23 => constants.OpCode.ret,
         24 => constants.OpCode.foreign_call,
+        25 => constants.OpCode.print_string,
         else => return error.InvalidInstruction,
     };
 }

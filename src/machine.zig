@@ -301,6 +301,11 @@ pub const VM = struct {
                     self.ip += 1;
                     try self.callForeign(import_index);
                 },
+                .print_string => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    const string = try self.guestCString(self.stack[self.sp - 1]);
+                    std.debug.print("{s}\n", .{string});
+                },
             }
         }
     }
@@ -391,10 +396,18 @@ pub const VM = struct {
         if (value < 0) return error.InvalidGuestPointer;
         const offset: usize = @intCast(value);
         if (offset >= self.program_len) return error.InvalidGuestPointer;
-        if (require_terminator and std.mem.indexOfScalar(u8, self.memory[offset..self.program_len], 0) == null) {
-            return error.UnterminatedGuestString;
-        }
+        if (require_terminator) _ = try self.guestCString(value);
         return @intFromPtr(self.memory[offset..].ptr);
+    }
+
+    fn guestCString(self: *VM, value: i32) ![]const u8 {
+        if (value <= 0) return error.InvalidGuestPointer;
+        const offset: usize = @intCast(value);
+        if (offset >= self.program_len) return error.InvalidGuestPointer;
+
+        const bytes = self.memory[offset..self.program_len];
+        const terminator = std.mem.indexOfScalar(u8, bytes, 0) orelse return error.UnterminatedGuestString;
+        return bytes[0..terminator];
     }
 };
 
@@ -436,4 +449,31 @@ test "resolves and invokes a zero-argument Windows API" {
 
     try std.testing.expectEqual(@as(usize, 1), vm.sp);
     try std.testing.expect(vm.stack[0] > 0);
+}
+
+test "print_string prints a VIG-managed string and retains its address" {
+    var vm = VM.init();
+    defer vm.deinit();
+
+    const program = [_]u8{
+        @intFromEnum(constants.OpCode.push), 7, 0, 0, 0,
+        @intFromEnum(constants.OpCode.print_string),
+        @intFromEnum(constants.OpCode.halt),
+        'h', 'e', 'l', 'l', 'o', 0,
+    };
+    try vm.loadProgram(&program);
+    try vm.run();
+
+    try std.testing.expectEqual(@as(usize, 1), vm.sp);
+    try std.testing.expectEqual(@as(i32, 7), vm.stack[0]);
+}
+
+test "guest strings must be non-null and NUL-terminated within the program" {
+    var vm = VM.init();
+    defer vm.deinit();
+
+    const program = [_]u8{ @intFromEnum(constants.OpCode.halt), 'x' };
+    try vm.loadProgram(&program);
+    try std.testing.expectError(error.InvalidGuestPointer, vm.guestCString(0));
+    try std.testing.expectError(error.UnterminatedGuestString, vm.guestCString(1));
 }
