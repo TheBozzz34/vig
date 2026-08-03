@@ -2,8 +2,9 @@ const std = @import("std");
 const Io = std.Io;
 const machine = @import("machine.zig");
 const test_program = @import("test_program.zig").test_program;
+const utils = @import("utils.zig");
 
-const vig = @import("vig");
+const vm_memory_size = 1024;
 
 pub fn main(init: std.process.Init) !void {
     std.log.info("Starting VIG", .{});
@@ -19,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("Init VM", .{});
 
-    var vm: machine.VM = machine.VM.init(arena, 1024) catch |err| {
+    var vm: machine.VM = machine.VM.init(arena, vm_memory_size) catch |err| {
         std.log.err("Failed to initialize VM: {s}", .{@errorName(err)});
         return err;
     };
@@ -27,16 +28,25 @@ pub fn main(init: std.process.Init) !void {
     defer vm.deinit(arena);
 
     std.log.info("VM initialized successfully.", .{});
-    std.log.info("Pushing test program into VM memory", .{});
 
-    // Load the test program into the VM's memory
-    if (test_program.len > vm.memory.len) {
-        std.log.err("Test program is too large for VM memory.", .{});
-        return error.ProgramTooLarge;
+    if (args.len > 2) {
+        std.log.err("Usage: vig [program-file]", .{});
+        return error.InvalidArguments;
     }
-    @memcpy(vm.memory[0..test_program.len], test_program[0..]);
 
-    std.log.info("Program copied to VM memory.", .{});
+    if (args.len == 2) {
+        const path = args[1];
+        std.log.info("Loading program from file: {s}", .{path});
+        utils.loadProgramFromFile(&vm, init.io, init.gpa, path) catch |err| {
+            std.log.err("Failed to load program: {s}", .{@errorName(err)});
+            return err;
+        };
+    } else {
+        std.log.info("No program file supplied; loading the built-in test program.", .{});
+        try vm.loadProgram(&test_program);
+    }
+
+    std.log.info("Loaded {d} program bytes.", .{vm.program_len});
     std.log.info("Running VM", .{});
 
     machine.run(&vm) catch |err| {

@@ -7,6 +7,10 @@ pub const VM = struct {
     memory: []u8,
     stack: [256]i32,
 
+    // Number of bytes occupied by the currently loaded program. This is the
+    // execution boundary; memory after this point is not executable code.
+    program_len: usize = 0,
+
     // Pointers/Registers
     ip: usize = 0, // Instruction Pointer
     sp: usize = 0, // Stack Pointer
@@ -18,18 +22,34 @@ pub const VM = struct {
         return VM{
             .memory = mem,
             .stack = @splat(0),
+            .program_len = 0,
             .sp = 0,
             .ip = 0,
         };
     }
 
+    pub fn loadProgram(self: *VM, program: []const u8) !void {
+        if (program.len > self.memory.len) return error.ProgramTooLarge;
+
+        // Clear the old program and any stale bytes before copying the new one.
+        @memset(self.memory, 0);
+        @memcpy(self.memory[0..program.len], program);
+
+        self.program_len = program.len;
+        self.ip = 0;
+        self.sp = 0;
+        self.stack = @splat(0);
+    }
+
     pub fn deinit(self: *VM, allocator: std.mem.Allocator) void {
         allocator.free(self.memory);
+        self.memory = undefined;
+        self.program_len = 0;
     }
 };
 
 pub fn run(self: *VM) !void {
-    while (self.ip < self.memory.len) {
+    while (self.ip < self.program_len) {
         // Fetch
         const raw_op = self.memory[self.ip];
 
@@ -46,7 +66,7 @@ pub fn run(self: *VM) !void {
 
             .push => {
                 // Fetch next 4 bytes as an i32 operand
-                if (self.ip + 4 > self.memory.len) return error.SegmentFault;
+                if (self.program_len - self.ip < 4) return error.SegmentFault;
                 const value = std.mem.readInt(i32, self.memory[self.ip..][0..4], .little);
                 self.ip += 4;
 
@@ -80,4 +100,26 @@ pub fn run(self: *VM) !void {
             },
         }
     }
+}
+
+test "execution stops at the loaded program boundary" {
+    var vm = try VM.init(std.testing.allocator, 8);
+    defer vm.deinit(std.testing.allocator);
+
+    const program = [_]u8{
+        @intFromEnum(constants.OpCode.push),
+        1,
+        0,
+        0,
+        0,
+    };
+    try vm.loadProgram(&program);
+
+    // This would be executed as an invalid instruction if run used the VM's
+    // total memory size instead of program_len.
+    vm.memory[program.len] = 0xff;
+
+    try run(&vm);
+    try std.testing.expectEqual(program.len, vm.program_len);
+    try std.testing.expectEqual(@as(usize, 1), vm.sp);
 }
