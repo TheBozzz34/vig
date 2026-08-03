@@ -3,8 +3,6 @@ const Io = std.Io;
 const machine = @import("machine.zig");
 const utils = @import("utils.zig");
 
-const vm_memory_size = 1024;
-
 pub fn main(init: std.process.Init) !void {
     std.log.info("Starting VIG", .{});
 

@@ -1,8 +1,16 @@
+// size of the VM's main memory
 pub const memory_size = 4096;
+
+// size of the VM's stack
 pub const stack_size = 256;
+
+// size of the VM's data segment, used for load and store ops
 pub const data_size = 256;
+
+// size of the VM's call stack, used for function calls and returns
 pub const call_stack_size = 128;
 
+// All opcodes
 pub const OpCode = enum(u8) {
     halt = 0,
     push = 1,

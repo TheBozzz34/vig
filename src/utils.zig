@@ -44,6 +44,7 @@ pub fn loadProgramFromFile(vm: *machine.VM, io: Io, allocator: std.mem.Allocator
     try vm.loadProgram(program);
 }
 
+// compare two integers and push the result onto the stack
 pub fn binaryComparison(
     self: *machine.VM,
     comptime compare: fn (i32, i32) bool,
@@ -56,7 +57,7 @@ pub fn binaryComparison(
     self.sp -= 1;
     self.stack[self.sp - 1] = if (compare(a, b)) 1 else 0;
 }
-
+// A collection of comparison functions for the VM
 pub const comparisons = struct {
     pub fn eq(a: i32, b: i32) bool {
         return a == b;
@@ -83,6 +84,7 @@ pub const comparisons = struct {
     }
 };
 
+// Read a 32-bit unsigned integer from the VM's memory at the current instruction pointer
 pub fn readU32(self: *machine.VM) !u32 {
     if (self.ip > self.program_len or self.program_len - self.ip < 4) {
         return error.SegmentFault;

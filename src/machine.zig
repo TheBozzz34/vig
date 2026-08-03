@@ -21,6 +21,7 @@ pub const VM = struct {
     ip: usize = 0, // Instruction Pointer
     sp: usize = 0, // Stack Pointer
 
+    // reset vm state
     pub fn reset(self: *VM) void {
         @memset(&self.stack, 0);
         @memset(&self.data, 0);
@@ -32,6 +33,7 @@ pub const VM = struct {
         self.csp = 0;
     }
 
+    // initialize the VM with default values
     pub fn init() VM {
         return .{
             .memory = @splat(0),
@@ -45,6 +47,7 @@ pub const VM = struct {
         };
     }
 
+    // Load a program into the VM's memory, a program is just a sequence of bytes
     pub fn loadProgram(self: *VM, program: []const u8) !void {
         if (program.len > self.memory.len) {
             return error.ProgramTooLarge;
@@ -56,6 +59,7 @@ pub const VM = struct {
         self.program_len = program.len;
     }
 
+    // loop through instructions in memory, fetch, decode, and execute them
     pub fn run(self: *VM) !void {
         while (self.ip < self.program_len) {
             // Fetch the next instruction
