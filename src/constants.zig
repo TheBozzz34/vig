@@ -16,4 +16,7 @@ pub const OpCode = enum(u8) {
     lte = 14,
     gt = 15,
     gte = 16,
+    jmp = 17,
+    jmp_zero = 18,
+    jmp_not_zero = 19,
 };

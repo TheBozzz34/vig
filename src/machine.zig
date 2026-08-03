@@ -162,6 +162,51 @@ pub fn run(self: *VM) !void {
             .lte => try utils.binaryComparison(self, utils.comparisons.lte),
             .gt => try utils.binaryComparison(self, utils.comparisons.gt),
             .gte => try utils.binaryComparison(self, utils.comparisons.gte),
+            .jmp => {
+                const target = try utils.readU32();
+
+                if (target >= self.memory.len) {
+                    return error.SegmentFault;
+                }
+
+                self.ip = target;
+            },
+            .jmp_zero => {
+                const target = try utils.readU32();
+
+                if (target >= self.memory.len) {
+                    return error.SegmentFault;
+                }
+
+                if (self.sp == 0) {
+                    return error.StackUnderflow;
+                }
+
+                self.sp -= 1;
+                const condition = self.stack[self.sp];
+
+                if (condition == 0) {
+                    self.ip = target;
+                }
+            },
+            .jmp_not_zero => {
+                const target = try utils.readU32();
+
+                if (target >= self.memory.len) {
+                    return error.SegmentFault;
+                }
+
+                if (self.sp == 0) {
+                    return error.StackUnderflow;
+                }
+
+                self.sp -= 1;
+                const condition = self.stack[self.sp];
+
+                if (condition != 0) {
+                    self.ip = target;
+                }
+            },
         }
     }
 }

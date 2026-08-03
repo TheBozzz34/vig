@@ -24,6 +24,9 @@ pub fn intToEnum(opcode: u8) !constants.OpCode {
         14 => constants.OpCode.lte,
         15 => constants.OpCode.gt,
         16 => constants.OpCode.gte,
+        17 => constants.OpCode.jmp,
+        18 => constants.OpCode.jmp_zero,
+        19 => constants.OpCode.jmp_not_zero,
         else => return error.InvalidInstruction,
     };
 }
@@ -75,3 +78,18 @@ pub const comparisons = struct {
         return a >= b;
     }
 };
+
+pub fn readU32(self: *machine.VM) !u32 {
+    if (self.ip + 4 > self.memory.len) {
+        return error.SegmentFault;
+    }
+
+    const value = std.mem.readInt(
+        u32,
+        self.memory[self.ip..][0..4],
+        .little,
+    );
+
+    self.ip += 4;
+    return value;
+}
