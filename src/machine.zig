@@ -50,6 +50,8 @@ pub fn run(self: *VM) !void {
                 const value = std.mem.readInt(i32, self.memory[self.ip..][0..4], .little);
                 self.ip += 4;
 
+                if (self.sp >= self.stack.len) return error.StackOverflow;
+
                 self.stack[self.sp] = value;
                 self.sp += 1;
             },
