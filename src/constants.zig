@@ -19,4 +19,8 @@ pub const OpCode = enum(u8) {
     jmp = 17,
     jmp_zero = 18,
     jmp_not_zero = 19,
+    load = 20,
+    store = 21,
+    call = 22,
+    ret = 23,
 };

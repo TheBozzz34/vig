@@ -3,12 +3,18 @@ const constants = @import("constants.zig");
 const utils = @import("utils.zig");
 
 pub const VM = struct {
-    // Array-based memory and stack
+    // memory and stack, arrays of bytes and ints
     memory: []u8,
     stack: [256]i32,
 
-    // Number of bytes occupied by the currently loaded program. This is the
-    // execution boundary; memory after this point is not executable code.
+    // data segment for load and store ops
+    data: []i32,
+
+    // data segment for call and return ops
+    call_stack: []usize,
+    csp: usize,
+
+    // Number of bytes occupied by the currently loaded program. Memory after this point is not executable code.
     program_len: usize = 0,
 
     // Pointers/Registers
@@ -41,6 +47,7 @@ pub const VM = struct {
         self.stack = @splat(0);
     }
 
+    // free the allocated memory when the VM is no longer needed
     pub fn deinit(self: *VM, allocator: std.mem.Allocator) void {
         allocator.free(self.memory);
         self.memory = undefined;
@@ -50,17 +57,17 @@ pub const VM = struct {
 
 pub fn run(self: *VM) !void {
     while (self.ip < self.program_len) {
-        // Fetch
+        // Fetch the next instruction
         const raw_op = self.memory[self.ip];
 
-        // Decode
+        // Decode the instruction into an enum
         const op = utils.intToEnum(raw_op) catch {
             std.debug.print("Invalid OpCode: {x}\n", .{raw_op});
             return error.InvalidInstruction;
         };
         self.ip += 1;
 
-        // Execute
+        // switch on enum
         switch (op) {
             .halt => return,
 
@@ -206,6 +213,57 @@ pub fn run(self: *VM) !void {
                 if (condition != 0) {
                     self.ip = target;
                 }
+            },
+            .load => {
+                const address = try utils.readU32(self);
+
+                if (address >= self.data.len) {
+                    return error.SegmentFault;
+                }
+
+                if (self.sp >= self.stack.len) {
+                    return error.StackOverflow;
+                }
+
+                self.stack[self.sp] = self.data[address];
+                self.sp += 1;
+            },
+            .store => {
+                const address = try utils.readU32(self);
+
+                if (address >= self.data.len) {
+                    return error.SegmentFault;
+                }
+
+                if (self.sp == 0) {
+                    return error.StackUnderflow;
+                }
+
+                self.sp -= 1;
+                self.data[address] = self.stack[self.sp];
+            },
+            .call => {
+                const target = try utils.readU32(self);
+
+                if (target >= self.memory.len) {
+                    return error.SegmentFault;
+                }
+
+                if (self.csp >= self.call_stack.len) {
+                    return error.CallStackOverflow;
+                }
+
+                self.call_stack[self.csp] = self.ip;
+                self.csp += 1;
+                self.ip = target;
+            },
+            .ret => {
+                if (self.csp == 0) {
+                    return error.CallStackUnderflow;
+                }
+
+                self.csp -= 1;
+                self.ip = self.call_stack[self.csp];
             },
         }
     }
