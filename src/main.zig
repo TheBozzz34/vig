@@ -1,7 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
 const machine = @import("machine.zig");
-const test_program = @import("test_program.zig").test_program;
 const utils = @import("utils.zig");
 
 const vm_memory_size = 1024;
@@ -42,8 +41,8 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
     } else {
-        std.log.info("No program file supplied; loading the built-in test program.", .{});
-        try vm.loadProgram(&test_program);
+        std.log.info("No program file supplied. Exiting.", .{});
+        return;
     }
 
     std.log.info("Loaded {d} program bytes.", .{vm.program_len});

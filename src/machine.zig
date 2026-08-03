@@ -98,6 +98,70 @@ pub fn run(self: *VM) !void {
                 if (self.sp == 0) return error.StackUnderflow;
                 std.debug.print("{d}\n", .{self.stack[self.sp - 1]});
             },
+
+            .dup => {
+                if (self.sp == 0) return error.StackUnderflow;
+                if (self.sp >= self.stack.len) return error.StackOverflow;
+
+                self.stack[self.sp] = self.stack[self.sp - 1];
+                self.sp += 1;
+            },
+            .pop => {
+                if (self.sp == 0) return error.StackUnderflow;
+                self.sp -= 1;
+            },
+            .swap => {
+                if (self.sp < 2) return error.StackUnderflow;
+
+                const a = self.stack[self.sp - 1];
+                self.stack[self.sp - 1] = self.stack[self.sp - 2];
+                self.stack[self.sp - 2] = a;
+            },
+            .mul => {
+                if (self.sp < 2) return error.StackUnderflow;
+
+                const b = self.stack[self.sp - 1];
+                const a = self.stack[self.sp - 2];
+                const result = @mulWithOverflow(a, b);
+
+                if (result[1] != 0) return error.IntegerOverflow;
+
+                self.sp -= 1;
+                self.stack[self.sp - 1] = result[0];
+            },
+            .div => {
+                if (self.sp < 2) return error.StackUnderflow;
+
+                const b = self.stack[self.sp - 1];
+                const a = self.stack[self.sp - 2];
+
+                if (b == 0) return error.DivisionByZero;
+
+                // minInt / -1 cannot fit in i32.
+                if (a == std.math.minInt(i32) and b == -1) {
+                    return error.IntegerOverflow;
+                }
+
+                self.sp -= 1;
+                self.stack[self.sp - 1] = @divTrunc(a, b);
+            },
+            .mod => {
+                if (self.sp < 2) return error.StackUnderflow;
+
+                const b = self.stack[self.sp - 1];
+                const a = self.stack[self.sp - 2];
+
+                if (b == 0) return error.DivisionByZero;
+
+                self.sp -= 1;
+                self.stack[self.sp - 1] = @rem(a, b);
+            },
+            .eq => try utils.binaryComparison(self, utils.compareEq),
+            .ne => try utils.binaryComparison(self, utils.compareNe),
+            .lt => try utils.binaryComparison(self, utils.compareLt),
+            .lte => try utils.binaryComparison(self, utils.compareLte),
+            .gt => try utils.binaryComparison(self, utils.compareGt),
+            .gte => try utils.binaryComparison(self, utils.compareGte),
         }
     }
 }

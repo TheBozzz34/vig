@@ -12,6 +12,18 @@ pub fn intToEnum(opcode: u8) !constants.OpCode {
         2 => constants.OpCode.add,
         3 => constants.OpCode.sub,
         4 => constants.OpCode.print,
+        5 => constants.OpCode.dup,
+        6 => constants.OpCode.pop,
+        7 => constants.OpCode.swap,
+        8 => constants.OpCode.mul,
+        9 => constants.OpCode.div,
+        10 => constants.OpCode.mod,
+        11 => constants.OpCode.eq,
+        12 => constants.OpCode.ne,
+        13 => constants.OpCode.lt,
+        14 => constants.OpCode.lte,
+        15 => constants.OpCode.gt,
+        16 => constants.OpCode.gte,
         else => return error.InvalidInstruction,
     };
 }
@@ -23,4 +35,41 @@ pub fn loadProgramFromFile(vm: *machine.VM, io: Io, allocator: std.mem.Allocator
     defer allocator.free(program);
 
     try vm.loadProgram(program);
+}
+
+pub fn binaryComparison(
+    self: *machine.VM,
+    comptime compare: fn (i32, i32) bool,
+) !void {
+    if (self.sp < 2) return error.StackUnderflow;
+
+    const b = self.stack[self.sp - 1];
+    const a = self.stack[self.sp - 2];
+
+    self.sp -= 1;
+    self.stack[self.sp - 1] = if (compare(a, b)) 1 else 0;
+}
+
+pub fn compareEq(a: i32, b: i32) bool {
+    return a == b;
+}
+
+pub fn compareNe(a: i32, b: i32) bool {
+    return a != b;
+}
+
+pub fn compareLt(a: i32, b: i32) bool {
+    return a < b;
+}
+
+pub fn compareLte(a: i32, b: i32) bool {
+    return a <= b;
+}
+
+pub fn compareGt(a: i32, b: i32) bool {
+    return a > b;
+}
+
+pub fn compareGte(a: i32, b: i32) bool {
+    return a >= b;
 }
