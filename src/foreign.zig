@@ -2,6 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const constants = @import("constants.zig");
 
+// Foreign function interface for VIG. This is a minimal implementation that
+// only supports Windows x64 integer/pointer calls.  This is enough to call
+// simple Windows APIs
+
 pub const ArgType = enum(u8) {
     i32 = 0,
     u32 = 1,
@@ -26,12 +30,18 @@ pub const Import = struct {
     arg_types: [constants.max_foreign_args]ArgType,
 };
 
+// Neccessary Windows API functions for dynamic library loading and symbol resolution
 extern "kernel32" fn LoadLibraryA(library_name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetProcAddress(library: *anyopaque, symbol_name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
 extern "kernel32" fn FreeLibrary(library: *anyopaque) callconv(.winapi) i32;
 
+// Resolve a foreign function import by loading the specified library and looking up the symbol address. Returns an Import struct on success.
 pub fn resolve(library_name: []const u8, symbol_name: []const u8, arg_types: []const ArgType) !Import {
+
+    // Foreign calls are only supported on Windows for now
     if (builtin.os.tag != .windows) return error.ForeignCallsUnsupported;
+
+    // Validate input parameters
     if (library_name.len == 0 or symbol_name.len == 0) return error.InvalidForeignImport;
     if (symbol_name.len > 255 or arg_types.len > constants.max_foreign_args) return error.InvalidForeignImport;
 
@@ -40,6 +50,8 @@ pub fn resolve(library_name: []const u8, symbol_name: []const u8, arg_types: []c
     var library_z: [256:0]u8 = undefined;
     @memcpy(library_z[0..library_name.len], library_name);
     library_z[library_name.len] = 0;
+
+    // Load the library and get the symbol address
     const library = LoadLibraryA(library_z[0..library_name.len :0].ptr) orelse return error.ForeignLibraryNotFound;
     errdefer _ = FreeLibrary(library);
 
@@ -61,10 +73,12 @@ pub fn resolve(library_name: []const u8, symbol_name: []const u8, arg_types: []c
     };
 }
 
+// free loaded library
 pub fn close(import: *Import) void {
     _ = FreeLibrary(import.library);
 }
 
+// invoke a forign function
 pub fn invoke(import: *const Import, args: [constants.max_foreign_args]usize) usize {
     // VIG foreign calls are Windows x64 integer/pointer calls only. All of
     // these argument types occupy one ABI word, so arity is sufficient here.
