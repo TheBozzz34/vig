@@ -11,9 +11,6 @@ pub fn main(init: std.process.Init) !void {
 
     // Accessing command line arguments:
     const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
-    }
 
     var vm = machine.VM.init();
     std.log.info("VM initialized successfully.", .{});
@@ -36,12 +33,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.log.info("Loaded {d} program bytes.", .{vm.program_len});
-    std.log.info("Running VM", .{});
+    std.log.info("============= VM OUTPUT =============", .{});
 
     vm.run() catch |err| {
         std.log.err("VM execution failed: {s}", .{@errorName(err)});
         return err;
     };
 
+    std.log.info("============= END OF OUTPUT =============", .{});
     std.log.info("VM execution completed successfully.", .{});
 }
