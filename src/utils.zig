@@ -47,9 +47,12 @@ test "file loader permits a full memory image behind a container header" {
     );
     defer std.testing.allocator.free(path);
 
-    var vm = machine.VM.init(undefined, undefined);
+    // The VM is too large for the stack of a test function, so it goes on the heap.
+    const vm = try std.testing.allocator.create(machine.VM);
+    defer std.testing.allocator.destroy(vm);
+    vm.init(undefined, undefined);
     defer vm.deinit();
-    try loadProgramFromFile(&vm, std.testing.io, std.testing.allocator, path);
+    try loadProgramFromFile(vm, std.testing.io, std.testing.allocator, path);
     try std.testing.expectEqual(constants.memory_size, vm.program_len);
     try std.testing.expectEqual(constants.memory_size, vm.code_len);
 }

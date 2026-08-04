@@ -8,6 +8,14 @@ const container = bytecode.container;
 const verify = bytecode.verify;
 const Io = std.Io;
 
+/// The virtual machine.
+///
+/// This structure holds the guest memory, the stacks and the verifier scratch
+/// inline, so it is far larger than a machine register and it grows with
+/// `constants.memory_size`. Therefore a caller keeps a VM behind a pointer and
+/// initialises it in place with `init`. A VM that a function returns by value, or
+/// that a `var` on the stack of a function holds, puts the whole of that memory on
+/// the call stack, and a larger `memory_size` then overruns it.
 pub const VM = struct {
     // The memory and the stack: an array of bytes and an array of integers.
     memory: [constants.memory_size]u8,
@@ -53,6 +61,17 @@ pub const VM = struct {
     ip: usize = 0, // the instruction pointer
     sp: usize = 0, // the stack pointer
 
+    // Working space for the bytecode verifier: one mark for each byte of the code
+    // region. The verifier needs `verify.scratchSize(code_len)` marks, and the
+    // code region is never larger than the memory of the VM.
+    //
+    // This buffer is a field and not a local of `verifyImage`, because a local
+    // puts it on the call stack. At the present `memory_size` that costs 4 KiB,
+    // which a stack absorbs; at the size that a C program needs it does not. The
+    // cost of the field is one byte of memory for each byte of guest memory, and
+    // the VM pays it once rather than on each load.
+    verify_scratch: [constants.memory_size]verify.Mark,
+
     // Set the state of the VM to its initial values.
     pub fn reset(self: *VM) void {
         self.clearForeignImports();
@@ -72,10 +91,16 @@ pub const VM = struct {
         self.clearForeignImports();
     }
 
-    // Make a VM that has the default values. The streams must stay in existence
-    // longer than the VM. `reset` does not change them.
-    pub fn init(input: *Io.Reader, output: *Io.Writer) VM {
-        return .{
+    // Give a VM its default values, in the storage that the caller supplies. The
+    // streams must stay in existence longer than the VM. `reset` does not change
+    // them.
+    //
+    // The caller owns the storage: an arena in `main`, the testing allocator in a
+    // test. This function writes into that storage and gives back no VM, so the
+    // memory of the VM never travels through a return value or through the stack of
+    // a function.
+    pub fn init(self: *VM, input: *Io.Reader, output: *Io.Writer) void {
+        self.* = .{
             .memory = @splat(0),
             .stack = @splat(0),
             .data = @splat(0),
@@ -90,6 +115,7 @@ pub const VM = struct {
             .output = output,
             .sp = 0,
             .ip = 0,
+            .verify_scratch = @splat(.unknown),
         };
     }
 
@@ -295,34 +321,24 @@ pub const VM = struct {
                     }
                 },
                 .load => {
-                    const raw_address = try utils.readU32(self);
-                    const address: usize = @intCast(raw_address);
-
-                    if (address >= self.data.len) {
-                        return error.SegmentFault;
-                    }
+                    const address = try self.operandAddress(try utils.readU32(self));
 
                     if (self.sp >= self.stack.len) {
                         return error.StackOverflow;
                     }
 
-                    self.stack[self.sp] = self.data[address];
+                    self.stack[self.sp] = self.readData(address);
                     self.sp += 1;
                 },
                 .store => {
-                    const raw_address = try utils.readU32(self);
-                    const address: usize = @intCast(raw_address);
-
-                    if (address >= self.data.len) {
-                        return error.SegmentFault;
-                    }
+                    const address = try self.operandAddress(try utils.readU32(self));
 
                     if (self.sp == 0) {
                         return error.StackUnderflow;
                     }
 
                     self.sp -= 1;
-                    self.data[address] = self.stack[self.sp];
+                    self.writeData(address, self.stack[self.sp]);
                 },
                 .call => {
                     const target = try utils.readU32(self);
@@ -365,7 +381,7 @@ pub const VM = struct {
                     if (self.sp == 0) return error.StackUnderflow;
 
                     const address = try self.dataAddress(self.stack[self.sp - 1]);
-                    self.stack[self.sp - 1] = self.data[address];
+                    self.stack[self.sp - 1] = self.readData(address);
                 },
                 .store_at => {
                     if (self.sp < 2) return error.StackUnderflow;
@@ -374,7 +390,7 @@ pub const VM = struct {
                     const value = self.stack[self.sp - 2];
 
                     self.sp -= 2;
-                    self.data[address] = value;
+                    self.writeData(address, value);
                 },
                 .@"and" => {
                     if (self.sp < 2) return error.StackUnderflow;
@@ -502,14 +518,57 @@ pub const VM = struct {
         return -@as(i32, @intCast(magnitude));
     }
 
+    // Guest memory ------------------------------------------------------------
+    //
+    // Each read and each write of guest data goes through this section. No
+    // instruction in `run` reaches `self.data` or `self.memory` on its own.
+    //
+    // The VM has two address spaces at this time. The data segment is an array of
+    // i32 slots, and `load`, `store`, `load_at` and `store_at` index it by slot.
+    // The program image is an array of bytes, and a guest pointer indexes it by
+    // byte. One number therefore means two different places, and a program cannot
+    // use it for both.
+    //
+    // The move to one byte-addressed guest memory changes the bodies here: a slot
+    // index becomes a byte offset, and an access gains a width. It does not change
+    // `run`, and it does not change how the two forms of an address relate to each
+    // other, because both already arrive through one check.
+
     // Check a data-segment address from the stack. A negative value has no
     // unsigned equivalent. Therefore a negative value gives a fault. It does not
     // become a large positive value.
-    fn dataAddress(self: *VM, value: i32) !usize {
+    fn dataAddress(self: *const VM, value: i32) !usize {
         if (value < 0) return error.SegmentFault;
-        const address: usize = @intCast(value);
-        if (address >= self.data.len) return error.SegmentFault;
-        return address;
+        return self.operandAddress(@intCast(value));
+    }
+
+    // The same check for an address that came from the operand of an instruction.
+    // The encoding of that operand is unsigned, so it needs no sign test, but the
+    // bound must be the one that `dataAddress` uses. If the two disagreed, then
+    // `store 4` and `push 4` with `store_at` could reach different cells.
+    fn operandAddress(self: *const VM, address: u32) !usize {
+        const index: usize = address;
+        if (index >= self.data.len) return error.SegmentFault;
+        return index;
+    }
+
+    // Read and write one data-segment cell. The caller has already checked the
+    // address. These two functions are the only place that indexes `data`, and
+    // they become a byte-addressed access of a given width.
+    fn readData(self: *const VM, address: usize) i32 {
+        return self.data[address];
+    }
+
+    fn writeData(self: *VM, address: usize, value: i32) void {
+        self.data[address] = value;
+    }
+
+    // The first address that a guest pointer cannot use. A pointer names a byte in
+    // the program image, which is the code region and then the static data. When
+    // the globals, the frames and a heap move into one memory, this limit grows to
+    // take in those regions, and `guestPointer` and `guestCString` both follow it.
+    fn guestPointerLimit(self: *const VM) usize {
+        return self.program_len;
     }
 
     fn clearForeignImports(self: *VM) void {
@@ -541,8 +600,8 @@ pub const VM = struct {
     // it. The vig-bytecode verifier gives the list of the checks.
     fn verifyImage(self: *VM, image: container.Image) !void {
         // One mark for each code byte. The VM has already checked the image
-        // against the size of the VM memory.
-        var scratch: [constants.memory_size]verify.Mark = undefined;
+        // against the size of the VM memory, so `verify_scratch` is large enough.
+        std.debug.assert(image.code.len <= self.verify_scratch.len);
 
         var failure: verify.Failure = undefined;
         verify.verify(.{
@@ -550,7 +609,7 @@ pub const VM = struct {
             .entry_point = image.header.entry_point,
             .import_count = image.header.import_count,
             .data_slots = constants.data_size,
-        }, &scratch, &failure) catch |err| {
+        }, &self.verify_scratch, &failure) catch |err| {
             self.verification_failure = failure;
             return err;
         };
@@ -601,7 +660,7 @@ pub const VM = struct {
         if (value == 0) return 0;
         if (value < 0) return error.InvalidGuestPointer;
         const offset: usize = @intCast(value);
-        if (offset >= self.program_len) return error.InvalidGuestPointer;
+        if (offset >= self.guestPointerLimit()) return error.InvalidGuestPointer;
         if (require_terminator) _ = try self.guestCString(value);
         return @intFromPtr(self.memory[offset..].ptr);
     }
@@ -609,9 +668,10 @@ pub const VM = struct {
     fn guestCString(self: *VM, value: i32) ![]const u8 {
         if (value <= 0) return error.InvalidGuestPointer;
         const offset: usize = @intCast(value);
-        if (offset >= self.program_len) return error.InvalidGuestPointer;
+        const limit = self.guestPointerLimit();
+        if (offset >= limit) return error.InvalidGuestPointer;
 
-        const bytes = self.memory[offset..self.program_len];
+        const bytes = self.memory[offset..limit];
         const terminator = std.mem.indexOfScalar(u8, bytes, 0) orelse return error.UnterminatedGuestString;
         return bytes[0..terminator];
     }
@@ -621,23 +681,29 @@ pub const VM = struct {
 
 // A VM and the buffer that collects the output of its program. Therefore a test
 // can check what the program printed.
+//
+// The VM is behind a pointer. A VM inside this structure would travel through the
+// return value of `init`, which copies the whole of the guest memory.
 const Harness = struct {
     input: Io.Reader,
     collected: Io.Writer.Allocating,
-    vm: VM,
+    vm: *VM,
 
     fn init() Harness {
         return initWithInput("");
     }
 
     fn initWithInput(input: []const u8) Harness {
+        const vm = std.testing.allocator.create(VM) catch @panic("OOM");
+        // `start` sets the stream pointers after the harness has its final
+        // address. A pointer taken here becomes invalid when this function gives
+        // a copy of the harness to the caller.
+        vm.init(undefined, undefined);
+
         return .{
             .input = .fixed(input),
             .collected = .init(std.testing.allocator),
-            // `start` sets the stream pointers after the structure has its
-            // final address. Pointers from this position become invalid when
-            // the function gives a copy of the structure to the caller.
-            .vm = VM.init(undefined, undefined),
+            .vm = vm,
         };
     }
 
@@ -648,6 +714,7 @@ const Harness = struct {
 
     fn deinit(self: *Harness) void {
         self.vm.deinit();
+        std.testing.allocator.destroy(self.vm);
         self.collected.deinit();
     }
 
@@ -736,7 +803,7 @@ test "execution stops at the loaded program boundary" {
     var harness = Harness.init();
     defer harness.deinit();
     harness.start();
-    const vm = &harness.vm;
+    const vm = harness.vm;
 
     const program = [_]u8{
         @intFromEnum(bytecode.OpCode.push),
@@ -761,7 +828,7 @@ test "a container starts at its entry point and maps static data after the code"
     var harness = Harness.init();
     defer harness.deinit();
     harness.start();
-    const vm = &harness.vm;
+    const vm = harness.vm;
 
     // First a prologue that the entry point goes past, then the program itself.
     // The string is in the static-data region. Therefore its address is the length
@@ -809,7 +876,7 @@ test "a container is verified before any of it runs" {
     var harness = Harness.init();
     defer harness.deinit();
     harness.start();
-    const vm = &harness.vm;
+    const vm = harness.vm;
 
     // A `jmp` into the static-data region. The file is correct, but the program
     // is not.
@@ -840,7 +907,7 @@ test "bare code and version 1 containers still load" {
     var harness = Harness.init();
     defer harness.deinit();
     harness.start();
-    const vm = &harness.vm;
+    const vm = harness.vm;
 
     // Code with no header, as in the first VIG programs.
     try vm.loadProgram(&(push(1) ++ [_]u8{ opByte(.print), opByte(.halt) }));
@@ -865,7 +932,7 @@ test "resolves and invokes a zero-argument Windows API" {
     var harness = Harness.init();
     defer harness.deinit();
     harness.start();
-    const vm = &harness.vm;
+    const vm = harness.vm;
 
     const program = "VIGF" ++ [_]u8{ 1, 1, 12, 19, 0 } ++
         "kernel32.dllGetCurrentProcessId" ++ [_]u8{
@@ -883,7 +950,7 @@ test "print_string prints a VIG-managed string and retains its address" {
     var harness = Harness.init();
     defer harness.deinit();
     harness.start();
-    const vm = &harness.vm;
+    const vm = harness.vm;
 
     const program = [_]u8{
         @intFromEnum(bytecode.OpCode.push),         7,                                  0,   0,   0,
@@ -902,7 +969,7 @@ test "guest strings must be non-null and NUL-terminated within the program" {
     var harness = Harness.init();
     defer harness.deinit();
     harness.start();
-    const vm = &harness.vm;
+    const vm = harness.vm;
 
     const program = [_]u8{ @intFromEnum(bytecode.OpCode.halt), 'x' };
     try vm.loadProgram(&program);

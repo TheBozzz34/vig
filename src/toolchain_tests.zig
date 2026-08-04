@@ -18,20 +18,25 @@ const machine = @import("machine.zig");
 
 const Io = std.Io;
 
-// A VM and the buffer that collects the output of its program.
+// A VM and the buffer that collects the output of its program. The VM is behind a
+// pointer, because it holds the guest memory inline and must not travel through
+// the return value of `init`.
 const Harness = struct {
     input: Io.Reader,
     collected: Io.Writer.Allocating,
-    vm: machine.VM,
+    vm: *machine.VM,
 
     fn init(input: []const u8) Harness {
+        const vm = std.testing.allocator.create(machine.VM) catch @panic("OOM");
+        // `start` sets the stream pointers after the harness has its final
+        // address. A pointer taken here becomes invalid when this function gives a
+        // copy of the harness to the caller.
+        vm.init(undefined, undefined);
+
         return .{
             .input = .fixed(input),
             .collected = .init(std.testing.allocator),
-            // `start` sets the stream pointers after the structure has its final
-            // address. A pointer from this position becomes invalid when the
-            // function gives a copy of the structure to the caller.
-            .vm = machine.VM.init(undefined, undefined),
+            .vm = vm,
         };
     }
 
@@ -42,6 +47,7 @@ const Harness = struct {
 
     fn deinit(self: *Harness) void {
         self.vm.deinit();
+        std.testing.allocator.destroy(self.vm);
         self.collected.deinit();
     }
 };

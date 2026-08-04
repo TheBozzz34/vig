@@ -83,16 +83,21 @@ const md5_cases = [_]struct { input: []const u8, digest: []const u8 }{
 
 // Running one example -------------------------------------------------------
 
+// The VM is behind a pointer: it holds the guest memory inline and must not travel
+// through the return value of `init`.
 const Harness = struct {
     input: Io.Reader,
     collected: Io.Writer.Allocating,
-    vm: machine.VM,
+    vm: *machine.VM,
 
     fn init(input: []const u8) Harness {
+        const vm = std.testing.allocator.create(machine.VM) catch @panic("OOM");
+        vm.init(undefined, undefined);
+
         return .{
             .input = .fixed(input),
             .collected = .init(std.testing.allocator),
-            .vm = machine.VM.init(undefined, undefined),
+            .vm = vm,
         };
     }
 
@@ -103,6 +108,7 @@ const Harness = struct {
 
     fn deinit(self: *Harness) void {
         self.vm.deinit();
+        std.testing.allocator.destroy(self.vm);
         self.collected.deinit();
     }
 };

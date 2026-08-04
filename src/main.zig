@@ -23,7 +23,10 @@ pub fn main(init: std.process.Init) !void {
     var stdin_buffer: [4096]u8 = undefined;
     var stdin = Io.File.stdin().readerStreaming(init.io, &stdin_buffer);
 
-    var vm = machine.VM.init(&stdin.interface, &stdout.interface);
+    // The VM holds the guest memory and the verifier scratch inline, so it is too
+    // large for the stack of this function. The arena lives as long as the process.
+    const vm = try arena.create(machine.VM);
+    vm.init(&stdin.interface, &stdout.interface);
     defer vm.deinit();
     std.log.info("VM initialized successfully.", .{});
 
@@ -35,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 2) {
         const path = args[1];
         std.log.info("Loading program from file: {s}", .{path});
-        utils.loadProgramFromFile(&vm, init.io, init.gpa, path) catch |err| {
+        utils.loadProgramFromFile(vm, init.io, init.gpa, path) catch |err| {
             if (vm.verification_failure) |failure| {
                 std.log.err(
                     "Program rejected by the bytecode verifier at code offset {d}: {s}",
