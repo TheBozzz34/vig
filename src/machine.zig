@@ -1165,3 +1165,158 @@ test "the data stack overflows rather than growing without bound" {
     }
     try expectTrap(program.items, error.StackOverflow, "");
 }
+
+// A program that fills the data stack to its capacity. The instructions that
+// follow it therefore have no room for a result.
+fn fullStack(program: *std.ArrayList(u8)) !void {
+    for (0..constants.stack_size) |_| {
+        try program.appendSlice(std.testing.allocator, &push(0));
+    }
+}
+
+test "every instruction that produces a value checks for stack overflow" {
+    // `push` is not the only instruction that grows the stack. Each of these
+    // checks the room for its result, and a missing check writes past the end of
+    // the array instead of giving a trap.
+    const producers = [_][]const bytecode.OpCode{
+        &.{.dup},
+        &.{.read_i32},
+        &.{.read_byte},
+        // `load` and `foreign_call` also push a result. `load` is the one with no
+        // dependency on the input stream or on an import table.
+    };
+
+    for (producers) |instructions| {
+        var program = std.ArrayList(u8).empty;
+        defer program.deinit(std.testing.allocator);
+
+        try fullStack(&program);
+        for (instructions) |instruction| try program.append(std.testing.allocator, opByte(instruction));
+        try program.append(std.testing.allocator, opByte(.halt));
+
+        // The input is not empty, so a missing overflow check in `read_i32` or
+        // `read_byte` gives a different error than a trap on the read itself.
+        var harness = Harness.initWithInput("1 2 3");
+        defer harness.deinit();
+        harness.start();
+
+        try harness.vm.loadProgram(program.items);
+        try std.testing.expectError(error.StackOverflow, harness.vm.run());
+        // The instruction refused to run. Therefore it left the stack full and
+        // did not go past its capacity.
+        try std.testing.expectEqual(constants.stack_size, harness.vm.sp);
+    }
+
+    // `load` reads the data segment onto the stack and needs the same check.
+    var with_load = std.ArrayList(u8).empty;
+    defer with_load.deinit(std.testing.allocator);
+    try fullStack(&with_load);
+    try with_load.appendSlice(std.testing.allocator, &withAddress(.load, 0));
+    try with_load.append(std.testing.allocator, opByte(.halt));
+    try expectTrap(with_load.items, error.StackOverflow, "");
+}
+
+test "recursion without an end overflows the call stack" {
+    // A `call` to offset 0 is a call to itself. Each one saves a return offset, so
+    // the call stack reaches its capacity and the VM traps. Without the check the
+    // VM writes past the end of `call_stack`.
+    //
+    // The program has no header, so no verifier reads it. A verifier cannot find
+    // this fault in any case: the recursion is correct control flow.
+    const program = withAddress(.call, 0) ++ [_]u8{opByte(.halt)};
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    try harness.vm.loadProgram(&program);
+    try std.testing.expectError(error.CallStackOverflow, harness.vm.run());
+    try std.testing.expectEqual(constants.call_stack_size, harness.vm.csp);
+}
+
+test "an operand that runs past the end of the code region gives a fault" {
+    // The last instruction of each program needs four operand bytes and does not
+    // have them. A program with no header is not verified, so the run-time check
+    // is the only one that can find this.
+    //
+    // `push` counts the bytes itself and `jmp` uses `utils.readU32`. Therefore
+    // both paths need a case.
+    try expectTrap(&[_]u8{ opByte(.push), 0, 0 }, error.SegmentFault, "");
+    try expectTrap(&[_]u8{ opByte(.jmp), 0, 0 }, error.SegmentFault, "");
+    try expectTrap(&[_]u8{ opByte(.load), 1 }, error.SegmentFault, "");
+    // An operand that is inside the program image but outside the code region is
+    // still a fault. The static data is not executable, so it is not an operand
+    // either.
+    const image = try buildContainer(.{
+        .code = &[_]u8{ opByte(.jmp), 0, 0 },
+        .data = &[_]u8{ 0, 0 },
+    });
+    defer std.testing.allocator.free(image);
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    // The verifier refuses this program before it runs, which is the stronger
+    // result: the fault never becomes a trap.
+    try std.testing.expectError(error.TruncatedInstruction, harness.vm.loadProgram(image));
+}
+
+test "a foreign call to an import that does not exist gives a fault" {
+    // The container declares no import, so index 0 names nothing. The verifier
+    // finds this in a current container. A program with no header reaches the
+    // run-time check instead, and that check must exist.
+    try expectTrap(
+        &[_]u8{ opByte(.foreign_call), 0, opByte(.halt) },
+        error.InvalidForeignImport,
+        "",
+    );
+}
+
+test "the data segment is bounded at run time and not only by the verifier" {
+    // A current container has its `load` and `store` addresses checked at load
+    // time. A program with no header has no such check, so the same bound has to
+    // hold while it runs. Both forms of the address need it.
+    const past_end: u32 = constants.data_size;
+
+    try expectTrap(
+        &(withAddress(.load, past_end) ++ [_]u8{opByte(.halt)}),
+        error.SegmentFault,
+        "",
+    );
+    try expectTrap(
+        &(push(0) ++ withAddress(.store, past_end) ++ [_]u8{opByte(.halt)}),
+        error.SegmentFault,
+        "",
+    );
+
+    // The same program in a current container never runs at all.
+    const image = try buildContainer(.{
+        .code = &(withAddress(.load, past_end) ++ [_]u8{opByte(.halt)}),
+    });
+    defer std.testing.allocator.free(image);
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    try std.testing.expectError(error.DataAddressOutOfRange, harness.vm.loadProgram(image));
+}
+
+test "the operand form and the stack form reach the same data cell" {
+    // `store 7` and `push 7` with `store_at` must name one cell. This is the
+    // invariant that lets a program calculate an address, and it is the invariant
+    // that changes shape when the data segment becomes byte-addressed.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    const program = push(11) ++ withAddress(.store, 7) ++
+        push(7) ++ [_]u8{ opByte(.load_at), opByte(.print), opByte(.pop) } ++
+        push(22) ++ push(7) ++ [_]u8{opByte(.store_at)} ++
+        withAddress(.load, 7) ++ [_]u8{ opByte(.print), opByte(.halt) };
+
+    try harness.vm.loadProgram(&program);
+    try harness.vm.run();
+
+    try std.testing.expectEqualStrings("11\n22\n", harness.written());
+    try std.testing.expectEqual(@as(i32, 22), harness.vm.data[7]);
+}
