@@ -4,14 +4,14 @@ VIG is a simple stack based virtual machine written in zig. It has a small set o
 Programs can be written in a simplified assembly language, assembled via vigasm, and run directly with vig.exe
 
 The instruction set, container format, and the bytecode verifier live in
-[vig-bytecode](../vig-bytecode)
+[vig-bytecode](https://github.com/TheBozzz34/vig-bytecode)
 
 ## Loading a program
 
-A program file is a has this structure: a header recording the code length, the
+A program file a has this structure: a header recording the code length, the
 static-data length, the entry point, the import-table length, and a format
 version and flags, followed by the import table, the code, and the static data.
-The [format is documented in vig-bytecode](../vig-bytecode/README.md#container-format).
+The [format is documented in vig-bytecode](https://github.com/TheBozzz34/vig-bytecode/README.md#container-format).
 
 The VM copies the code and the static data into memory as one image, with the data
 immediately after the code, then starts at the container's entry point. Only the
