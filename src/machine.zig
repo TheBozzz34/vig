@@ -1132,10 +1132,24 @@ test "traps report the failure and keep output printed before it" {
 }
 
 test "indirect addressing faults outside the data segment" {
-    // `data_size` is 256. Therefore 256 and each negative address are outside the
-    // segment.
-    try expectTrap(&(push(256) ++ [_]u8{ opByte(.load_at), opByte(.halt) }), error.SegmentFault, "");
+    // The bounds come from `data_size` and not from a literal. Therefore a change
+    // to the size of the segment cannot leave this test checking an address that
+    // is inside the segment.
+    const last: i32 = constants.data_size - 1;
+    const past_end: i32 = constants.data_size;
+
+    // The highest address in the segment still works. Without this case, a test
+    // that only checks the addresses outside the segment also passes when every
+    // address faults.
+    try expectOutput(&(push(last) ++ [_]u8{ opByte(.load_at), opByte(.print), opByte(.halt) }), "0\n");
+
+    try expectTrap(&(push(past_end) ++ [_]u8{ opByte(.load_at), opByte(.halt) }), error.SegmentFault, "");
     try expectTrap(&(push(-1) ++ [_]u8{ opByte(.load_at), opByte(.halt) }), error.SegmentFault, "");
+    try expectTrap(
+        &(push(0) ++ push(past_end) ++ [_]u8{ opByte(.store_at), opByte(.halt) }),
+        error.SegmentFault,
+        "",
+    );
     try expectTrap(
         &(push(0) ++ push(-1) ++ [_]u8{ opByte(.store_at), opByte(.halt) }),
         error.SegmentFault,

@@ -40,6 +40,11 @@
         // This package supplies the opcodes, the container format and the
         // verifier. The assembler uses the same package.
         .vig_bytecode = .{ .path = "../vig-bytecode" },
+        // The assembler, for the tests only. `vig.exe` does not assemble a
+        // program, and the executable does not import this module. A test uses it
+        // to check that the assembler and the VM agree about what a program means,
+        // and not only about the bytes of a container.
+        .vig_assembler = .{ .path = "../vig-assembler" },
     },
     .paths = .{
         "build.zig",

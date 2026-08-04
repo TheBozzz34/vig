@@ -1,0 +1,49 @@
+# The VM depends on vig-bytecode and, for its tests, on vig-assembler. Both are
+# path dependencies, so this workflow checks out the three repositories side by
+# side in the layout that a developer has locally.
+#
+# The job runs on Windows only. `src/foreign.zig` declares `LoadLibraryA`,
+# `GetProcAddress` and `FreeLibrary` as `extern "kernel32"` with no condition on
+# the target, and `clearForeignImports` reaches them from `deinit`. Therefore the
+# VM does not link for any other operating system at this time, even though
+# vig-bytecode and vig-assembler both cross-compile without a change.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: vig
+
+      - uses: actions/checkout@v4
+        with:
+          repository: TheBozzz34/vig-bytecode
+          path: vig-bytecode
+
+      # The tests assemble each example program and run it. Therefore the VM
+      # needs the assembler and its `examples` directory, not only the shared
+      # bytecode package.
+      - uses: actions/checkout@v4
+        with:
+          repository: TheBozzz34/vig-assembler
+          path: vig-assembler
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          # This value must be the `minimum_zig_version` of build.zig.zon. See
+          # the note in the vig-bytecode workflow.
+          version: 0.17.0-dev.1543+6db520a4c
+
+      # `test-all` runs the suite of this package and then the suite of each
+      # dependency. A change to the shared instruction set that breaks the
+      # assembler fails here, which `zig build test` on its own does not.
+      - run: zig build test-all --summary all
+        working-directory: vig
