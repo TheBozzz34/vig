@@ -466,6 +466,18 @@ pub const VM = struct {
                     try self.output.writeAll(&[_]u8{byte});
                     self.sp -= 1;
                 },
+
+                // Byte-addressed access to guest memory. The type gives the width
+                // of the access and, for a narrow load, whether the value keeps
+                // its sign.
+                .load8_u => try self.loadFrom(u8),
+                .load8_s => try self.loadFrom(i8),
+                .load16_u => try self.loadFrom(u16),
+                .load16_s => try self.loadFrom(i16),
+                .load32 => try self.loadFrom(i32),
+                .store8 => try self.storeTo(u8),
+                .store16 => try self.storeTo(u16),
+                .store32 => try self.storeTo(u32),
             }
         }
     }
@@ -567,8 +579,95 @@ pub const VM = struct {
     // the program image, which is the code region and then the static data. When
     // the globals, the frames and a heap move into one memory, this limit grows to
     // take in those regions, and `guestPointer` and `guestCString` both follow it.
+    //
+    // It stays at the image for now. A wider limit would let a `cstr` argument and
+    // `print_string` reach the space above the image, but memory there starts as
+    // zeros, so every address would look like the end of a string and
+    // `UnterminatedGuestString` would stop meaning anything. That trade belongs
+    // with the move of the static data into this memory.
     fn guestPointerLimit(self: *const VM) usize {
         return self.program_len;
+    }
+
+    // Byte-addressed access ---------------------------------------------------
+    //
+    // These are the instructions that address guest memory by byte, and they are
+    // the form that a C compiler emits. An address is a byte offset into `memory`,
+    // so it means the same thing as an address that a program pushes for
+    // `print_string` or gives to a foreign function.
+    //
+    // The i32 data segment above is a separate space that `load` and `store` still
+    // index by slot. The two do not overlap and a number means a different place in
+    // each. That is the state of this stage: these instructions arrive first, and
+    // the globals move out of the slot-indexed segment afterwards.
+
+    /// Whether an access reads guest memory or writes it.
+    const Access = enum { read, write };
+
+    /// The first address that a program can write.
+    ///
+    /// The code region is read-only while a program runs. The verifier reads that
+    /// region once, before any of it runs, and decides that each reachable byte
+    /// decodes and that each branch lands on an instruction. A store into the
+    /// region would make that decision worthless, because the bytes it checked are
+    /// not the bytes that would run. One comparison for each store keeps the
+    /// result of the verifier true for the whole run.
+    fn writableBase(self: *const VM) usize {
+        return self.code_len;
+    }
+
+    /// Check a byte address from the stack for an access of `width` bytes.
+    ///
+    /// A negative value has no unsigned equivalent, so it faults rather than
+    /// becoming a large positive address. The width is part of the check: an
+    /// address one byte inside memory is not a place to put four bytes.
+    ///
+    /// An unaligned address is permitted. A C compiler can then lay a structure out
+    /// without a rule from the VM about where each field may sit, and the cost here
+    /// is nothing, because the read and the write below do not need alignment.
+    fn memoryAddress(self: *const VM, value: i32, width: usize, access: Access) !usize {
+        if (value < 0) return error.SegmentFault;
+        const address: usize = @intCast(value);
+
+        // Written as a subtraction so it cannot overflow, whatever the width.
+        if (width > self.memory.len or address > self.memory.len - width) {
+            return error.SegmentFault;
+        }
+        if (access == .write and address < self.writableBase()) {
+            return error.WriteToCodeRegion;
+        }
+        return address;
+    }
+
+    fn readMemory(self: *const VM, comptime T: type, address: usize) T {
+        return std.mem.readInt(T, self.memory[address..][0..@sizeOf(T)], .little);
+    }
+
+    fn writeMemory(self: *VM, comptime T: type, address: usize, value: T) void {
+        std.mem.writeInt(T, self.memory[address..][0..@sizeOf(T)], value, .little);
+    }
+
+    // Replace the address on the stack with the value at that address. A signed `T`
+    // extends its sign into the upper bits of the stack slot and an unsigned `T`
+    // does not, which is the whole reason the narrow loads come in pairs.
+    fn loadFrom(self: *VM, comptime T: type) !void {
+        if (self.sp == 0) return error.StackUnderflow;
+
+        const address = try self.memoryAddress(self.stack[self.sp - 1], @sizeOf(T), .read);
+        self.stack[self.sp - 1] = self.readMemory(T, address);
+    }
+
+    // Take a value and an address off the stack, and write the low bits of that
+    // value. `T` is unsigned for every width, because a store keeps the bits and
+    // does not ask what they mean.
+    fn storeTo(self: *VM, comptime T: type) !void {
+        if (self.sp < 2) return error.StackUnderflow;
+
+        const address = try self.memoryAddress(self.stack[self.sp - 1], @sizeOf(T), .write);
+        const bits: u32 = @bitCast(self.stack[self.sp - 2]);
+
+        self.sp -= 2;
+        self.writeMemory(T, address, @truncate(bits));
     }
 
     fn clearForeignImports(self: *VM) void {
