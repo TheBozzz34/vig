@@ -8,6 +8,53 @@ const container = bytecode.container;
 const verify = bytecode.verify;
 const Io = std.Io;
 
+/// What the VM must remember about one active call.
+///
+/// A `call` makes one of these. An `enter` in the called function then fills in the
+/// two counts and the base of its storage. A function without locals never calls
+/// `enter`, so its frame stays at zero slots and costs no memory.
+const CallFrame = struct {
+    /// The code offset to continue at when the function returns.
+    return_ip: usize,
+    /// The stack pointer at the moment of the call, above the arguments. `ret`
+    /// returns the stack to this height, less the arguments that `enter` consumed.
+    /// Therefore a function that leaves a value behind cannot corrupt its caller.
+    operand_base: usize,
+    /// The address of slot 0 of the frame. This is meaningful only after `enter`.
+    frame_base: usize = 0,
+    /// The value to restore `frame_pointer` to on return.
+    saved_frame_pointer: usize,
+    /// Whether the function called `enter`.
+    ///
+    /// This decides whether `ret` returns the operand stack to the height it had
+    /// before the call. Only a function that declared its arguments can have them
+    /// counted, and without that count the VM does not know how many values the
+    /// function took. Truncating then would put back values that the function
+    /// consumed, which is worse than leaving the stack alone. Therefore a function
+    /// that declares a frame gets the convention enforced, and one that does not
+    /// keeps its own stack in order, as every VIG program did before frames existed.
+    entered: bool = false,
+    /// The arguments and the locals that `enter` asked for.
+    arguments: u16 = 0,
+    locals: u16 = 0,
+
+    /// The number of slots that the frame has.
+    fn slots(self: CallFrame) usize {
+        return @as(usize, self.arguments) + self.locals;
+    }
+};
+
+/// The value that fills an unused entry of the call stack.
+const empty_frame: CallFrame = .{
+    .return_ip = 0,
+    .operand_base = 0,
+    .saved_frame_pointer = 0,
+};
+
+/// The width of one frame slot. A slot holds an i32, which is what the operand stack
+/// holds. A wider C type needs more than one slot, and the compiler decides that.
+const slot_size = 4;
+
 /// The virtual machine.
 ///
 /// This structure holds the guest memory, the stacks and the verifier scratch
@@ -23,8 +70,15 @@ pub const VM = struct {
     stack: [constants.stack_size]i32,
 
     // The call stack for the `call` and `ret` instructions.
-    call_stack: [constants.call_stack_size]usize,
+    call_stack: [constants.call_stack_size]CallFrame,
     csp: usize,
+
+    // The lowest address that a frame uses. Frame memory grows down from the end of
+    // guest memory, and the program image sits at the start of it. Therefore the two
+    // grow towards each other, and one comparison finds the collision.
+    //
+    // This value is the end of memory when no function has a frame.
+    frame_pointer: usize = 0,
 
     foreign_imports: [bytecode.foreign.max_imports]?foreign.Import,
     foreign_import_count: usize,
@@ -73,7 +127,7 @@ pub const VM = struct {
         self.clearForeignImports();
         @memset(&self.stack, 0);
         @memset(&self.memory, 0);
-        @memset(&self.call_stack, 0);
+        @memset(&self.call_stack, empty_frame);
 
         self.code_len = 0;
         self.program_len = 0;
@@ -81,6 +135,9 @@ pub const VM = struct {
         self.ip = 0;
         self.sp = 0;
         self.csp = 0;
+        // No function has a frame, so frame memory has used nothing. It grows down
+        // from the end of memory as each `enter` runs.
+        self.frame_pointer = self.memory.len;
     }
 
     pub fn deinit(self: *VM) void {
@@ -93,8 +150,9 @@ pub const VM = struct {
         self.* = .{
             .memory = @splat(0),
             .stack = @splat(0),
-            .call_stack = @splat(0),
+            .call_stack = @splat(empty_frame),
             .csp = 0,
+            .frame_pointer = constants.memory_size,
             .foreign_imports = @splat(null),
             .foreign_import_count = 0,
             .code_len = 0,
@@ -349,17 +407,49 @@ pub const VM = struct {
                         return error.CallStackOverflow;
                     }
 
-                    self.call_stack[self.csp] = self.ip;
+                    // The frame has no storage yet. An `enter` in the called
+                    // function gives it some. A function that needs none never calls
+                    // `enter`, and its frame stays at zero slots.
+                    self.call_stack[self.csp] = .{
+                        .return_ip = self.ip,
+                        .operand_base = self.sp,
+                        .saved_frame_pointer = self.frame_pointer,
+                    };
                     self.csp += 1;
                     self.ip = target;
                 },
-                .ret => {
-                    if (self.csp == 0) {
-                        return error.CallStackUnderflow;
-                    }
+                .enter => {
+                    const shape = try utils.readFrameShape(self);
+                    try self.enterFrame(shape);
+                },
+                .ret => try self.returnFromCall(false),
+                .ret_val => try self.returnFromCall(true),
+                .load_local => {
+                    const index = try utils.readU16(self);
+                    const address = try self.localAddress(index);
 
-                    self.csp -= 1;
-                    self.ip = self.call_stack[self.csp];
+                    if (self.sp >= self.stack.len) return error.StackOverflow;
+                    self.stack[self.sp] = self.readMemory(i32, address);
+                    self.sp += 1;
+                },
+                .store_local => {
+                    const index = try utils.readU16(self);
+                    const address = try self.localAddress(index);
+
+                    if (self.sp == 0) return error.StackUnderflow;
+                    self.sp -= 1;
+                    self.writeMemory(u32, address, @bitCast(self.stack[self.sp]));
+                },
+                .local_addr => {
+                    const index = try utils.readU16(self);
+                    const address = try self.localAddress(index);
+
+                    if (self.sp >= self.stack.len) return error.StackOverflow;
+                    // A frame is inside guest memory, so the address of a local is an
+                    // ordinary address. Therefore a pointer to a local is the same
+                    // kind of value as a pointer to a global.
+                    self.stack[self.sp] = @intCast(address);
+                    self.sp += 1;
                 },
                 .foreign_call => {
                     if (self.ip >= self.code_len) return error.SegmentFault;
@@ -537,6 +627,100 @@ pub const VM = struct {
     // and `UnterminatedGuestString` would stop meaning anything.
     fn guestPointerLimit(self: *const VM) usize {
         return self.program_len;
+    }
+
+    // Call frames -------------------------------------------------------------
+    //
+    // A frame is storage in guest memory that belongs to one active call. Frame
+    // memory grows down from the end of memory while the program image sits at the
+    // start, so the two grow towards each other and a collision means the program
+    // has run out of room.
+    //
+    // A frame holds the arguments first and then the locals, so slot 0 is the first
+    // argument. `enter` takes the arguments off the operand stack and copies them in.
+    // Therefore an argument and a local are the same kind of thing once a function is
+    // running, and `local_addr` gives the address of either. A C parameter is an
+    // lvalue, and that is what this arrangement buys.
+
+    /// Give the running function its storage.
+    fn enterFrame(self: *VM, shape: bytecode.encode.FrameShape) !void {
+        // A frame belongs to a call. The entry point of a program is not called, so a
+        // function with locals is reached with `call` and the entry point is a stub
+        // that calls it. This is what a C runtime does with `main`.
+        if (self.csp == 0) return error.EnterOutsideCall;
+
+        const frame = &self.call_stack[self.csp - 1];
+        // One `enter` for each call. A second one would lose the first frame.
+        if (frame.entered) return error.FrameAlreadyEntered;
+
+        const arguments: usize = shape.arguments;
+        if (self.sp < arguments) return error.StackUnderflow;
+
+        const size = @as(usize, shape.slots()) * slot_size;
+        // Frame memory grows down. Therefore it runs out when it reaches the image.
+        if (size > self.frame_pointer or self.frame_pointer - size < self.program_len) {
+            return error.FrameMemoryExhausted;
+        }
+        const base = self.frame_pointer - size;
+
+        // The arguments are on the operand stack, the first one deepest. Copy them
+        // into the frame in that order, so slot 0 is the first argument.
+        self.sp -= arguments;
+        for (0..arguments) |index| {
+            self.writeMemory(u32, base + index * slot_size, @bitCast(self.stack[self.sp + index]));
+        }
+
+        // A local starts at zero. The bytes of this frame may hold what an earlier
+        // call left there, so they need clearing and cannot be assumed to be zero.
+        const locals_start = base + arguments * slot_size;
+        @memset(self.memory[locals_start .. base + size], 0);
+
+        frame.entered = true;
+        frame.frame_base = base;
+        frame.arguments = shape.arguments;
+        frame.locals = shape.locals;
+        self.frame_pointer = base;
+    }
+
+    /// Return to the caller. `with_value` keeps the top of the operand stack.
+    fn returnFromCall(self: *VM, with_value: bool) !void {
+        if (self.csp == 0) return error.CallStackUnderflow;
+
+        const value = if (with_value) blk: {
+            if (self.sp == 0) return error.StackUnderflow;
+            break :blk self.stack[self.sp - 1];
+        } else undefined;
+
+        self.csp -= 1;
+        const frame = self.call_stack[self.csp];
+
+        // Return the operand stack to the height it had before the call, less the
+        // arguments that `enter` took. Therefore a function that leaves values behind
+        // cannot corrupt its caller, and the caller needs no knowledge of what the
+        // function did with its stack.
+        //
+        // A function that declared no frame keeps its own stack in order. See the
+        // `entered` field.
+        if (frame.entered) {
+            self.sp = frame.operand_base - frame.arguments;
+            if (with_value) {
+                if (self.sp >= self.stack.len) return error.StackOverflow;
+                self.stack[self.sp] = value;
+                self.sp += 1;
+            }
+        }
+
+        self.frame_pointer = frame.saved_frame_pointer;
+        self.ip = frame.return_ip;
+    }
+
+    /// The address of one slot of the frame of the running function.
+    fn localAddress(self: *const VM, index: u16) !usize {
+        if (self.csp == 0) return error.NoActiveFrame;
+
+        const frame = self.call_stack[self.csp - 1];
+        if (index >= frame.slots()) return error.LocalOutOfRange;
+        return frame.frame_base + @as(usize, index) * slot_size;
     }
 
     // Byte-addressed access ---------------------------------------------------
@@ -1495,6 +1679,113 @@ test "a load or store operand is bounded at run time and not only by the verifie
     defer refused.deinit();
     refused.start();
     try std.testing.expectError(error.StoreIntoCodeRegion, refused.vm.loadProgram(into_code));
+}
+
+// Call frames ----------------------------------------------------------------
+
+// Encode `enter arguments locals`.
+fn enterFrame(arguments: u16, locals: u16) [5]u8 {
+    var bytes: [5]u8 = undefined;
+    bytes[0] = opByte(.enter);
+    std.mem.writeInt(u16, bytes[1..3], arguments, .little);
+    std.mem.writeInt(u16, bytes[3..5], locals, .little);
+    return bytes;
+}
+
+// Encode an instruction that takes a frame slot index.
+fn withLocal(code: bytecode.OpCode, index: u16) [3]u8 {
+    var bytes: [3]u8 = undefined;
+    bytes[0] = opByte(code);
+    std.mem.writeInt(u16, bytes[1..3], index, .little);
+    return bytes;
+}
+
+test "a frame belongs to a call" {
+    // The entry point of a program is not called, so it has no frame to enter.
+    try expectTrap(&(enterFrame(0, 1) ++ [_]u8{opByte(.halt)}), error.EnterOutsideCall, "");
+
+    // The frame instructions need an active frame as well.
+    for ([_]bytecode.OpCode{ .load_local, .store_local, .local_addr }) |instruction| {
+        try expectTrap(
+            &(push(0) ++ withLocal(instruction, 0) ++ [_]u8{opByte(.halt)}),
+            error.NoActiveFrame,
+            "",
+        );
+    }
+}
+
+test "one enter for each call" {
+    // A second `enter` would lose the frame that the first one made.
+    const code = withAddress(.call, 6) ++ [_]u8{opByte(.halt)} ++
+        enterFrame(0, 1) ++ enterFrame(0, 1) ++ [_]u8{opByte(.ret)};
+    try expectTrap(&code, error.FrameAlreadyEntered, "");
+}
+
+test "a slot outside the frame is refused" {
+    // The frame has two slots, so slot 2 is not in it. Without this check a function
+    // would read or write the frame of its caller.
+    //
+    // The call target is the length of what comes before it, and not a counted
+    // number, so a change to the prologue cannot leave a stale offset behind.
+    const prologue = push(0) ++ withAddress(.call, 0) ++ [_]u8{opByte(.halt)};
+    const code = push(0) ++ withAddress(.call, prologue.len) ++ [_]u8{opByte(.halt)} ++
+        enterFrame(1, 1) ++ withLocal(.load_local, 2) ++ [_]u8{opByte(.ret)};
+
+    try expectTrap(&code, error.LocalOutOfRange, "");
+}
+
+test "enter needs its arguments on the stack" {
+    // The function declares two arguments and the caller supplied one.
+    const code = push(1) ++ withAddress(.call, 11) ++ [_]u8{opByte(.halt)} ++
+        enterFrame(2, 0) ++ [_]u8{opByte(.ret)};
+    try expectTrap(&code, error.StackUnderflow, "");
+}
+
+test "a frame is released when its function returns" {
+    // Two calls one after the other must reuse the same memory. Without the release
+    // a loop of calls would use frame memory without end.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    const vm = harness.vm;
+
+    const prologue = withAddress(.call, 0) ++ withAddress(.call, 0) ++ [_]u8{opByte(.halt)};
+    const code = withAddress(.call, prologue.len) ++ withAddress(.call, prologue.len) ++
+        [_]u8{opByte(.halt)} ++
+        enterFrame(0, 2) ++ [_]u8{opByte(.ret)};
+
+    try vm.loadProgram(&code);
+    try vm.run();
+
+    // Every frame is gone, so frame memory has used nothing.
+    try std.testing.expectEqual(constants.memory_size, vm.frame_pointer);
+    try std.testing.expectEqual(@as(usize, 0), vm.csp);
+}
+
+test "a local starts at zero even where an earlier frame left a value" {
+    // Frame memory is reused, so the bytes of a new frame can hold what an earlier
+    // call wrote. `enter` must clear the locals.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    // The first call writes 7 into its local. The second call reads its own local,
+    // which is at the same address, and must find zero.
+    const prologue = withAddress(.call, 0) ++ withAddress(.call, 0) ++
+        [_]u8{ opByte(.print), opByte(.halt) };
+    const writer = enterFrame(0, 1) ++ push(7) ++ withLocal(.store_local, 0) ++
+        [_]u8{opByte(.ret)};
+
+    const writer_offset: u32 = prologue.len;
+    const reader_offset: u32 = writer_offset + writer.len;
+
+    const code = withAddress(.call, writer_offset) ++ withAddress(.call, reader_offset) ++
+        [_]u8{ opByte(.print), opByte(.halt) } ++ writer ++
+        enterFrame(0, 1) ++ withLocal(.load_local, 0) ++ [_]u8{opByte(.ret_val)};
+
+    try harness.vm.loadProgram(&code);
+    try harness.vm.run();
+    try std.testing.expectEqualStrings("0\n", harness.written());
 }
 
 // Byte-addressed access ------------------------------------------------------

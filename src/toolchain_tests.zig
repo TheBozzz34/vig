@@ -429,6 +429,177 @@ test "a read of the code region is allowed" {
     );
 }
 
+// Call frames ---------------------------------------------------------------
+
+test "a function reads its arguments from its frame" {
+    try expectSourceOutput(
+        \\entry start
+        \\start:
+        \\  push 6
+        \\  call square
+        \\  print
+        \\  halt
+        \\square:
+        \\  enter 1 0
+        \\  load_local 0
+        \\  load_local 0
+        \\  mul
+        \\  ret_val
+    ,
+        "36\n",
+    );
+}
+
+test "a local starts at zero and keeps a value across a call" {
+    // This is what a global cannot do. The inner call has its own frame, so it cannot
+    // reach the local of the outer one.
+    try expectSourceOutput(
+        \\entry start
+        \\start:
+        \\  call outer
+        \\  print
+        \\  halt
+        \\outer:
+        \\  enter 0 1
+        \\  load_local 0      # a local starts at zero
+        \\  print
+        \\  pop
+        \\  push 100
+        \\  store_local 0
+        \\  call inner        # inner has its own frame
+        \\  pop
+        \\  load_local 0      # still 100
+        \\  ret_val
+        \\inner:
+        \\  enter 0 1
+        \\  push 999
+        \\  store_local 0     # writes inner's local, not outer's
+        \\  push 0
+        \\  ret_val
+    ,
+        "0\n100\n",
+    );
+}
+
+test "recursion works with a local rather than a saved operand" {
+    // `factorial.vigas` is recursive today, but only because it keeps n on the operand
+    // stack across the recursive call. A frame makes the value belong to the call, and
+    // that is what C needs.
+    try expectSourceOutput(
+        \\entry start
+        \\start:
+        \\  push 10
+        \\  call fact
+        \\  print
+        \\  halt
+        \\fact:
+        \\  enter 1 0
+        \\  load_local 0
+        \\  push 2
+        \\  lt
+        \\  jmp_not_zero fact_base
+        \\  load_local 0
+        \\  load_local 0
+        \\  push 1
+        \\  sub
+        \\  call fact
+        \\  mul
+        \\  ret_val
+        \\fact_base:
+        \\  push 1
+        \\  ret_val
+    ,
+        "3628800\n",
+    );
+}
+
+test "the address of a local is an ordinary pointer" {
+    // A frame is in guest memory. Therefore a local has an address, and the byte
+    // instructions reach it in the same way as they reach a global.
+    try expectSourceOutput(
+        \\entry start
+        \\start:
+        \\  call body
+        \\  halt
+        \\body:
+        \\  enter 0 2
+        \\  push 1000
+        \\  store_local 0
+        \\  # Read the local through its address.
+        \\  local_addr 0
+        \\  load32
+        \\  print
+        \\  pop
+        \\  # Write the second local through its address, then read it as a slot.
+        \\  push 55
+        \\  local_addr 1
+        \\  store32
+        \\  load_local 1
+        \\  print
+        \\  pop
+        \\  # A local is four bytes, so the second one is four bytes after the first.
+        \\  local_addr 1
+        \\  local_addr 0
+        \\  sub
+        \\  print
+        \\  ret
+    ,
+        "1000\n55\n4\n",
+    );
+}
+
+test "a function with no frame keeps the older calling convention" {
+    // `check` takes two values off the operand stack and declares no frame. A `ret`
+    // that returned the stack to its height before the call would put those two values
+    // back. Therefore a function with no frame is left alone.
+    try expectSourceOutput(
+        \\entry start
+        \\start:
+        \\  push 7
+        \\  push 7
+        \\  call check
+        \\  push 3
+        \\  push 4
+        \\  call check
+        \\  halt
+        \\check:
+        \\  eq
+        \\  print
+        \\  pop
+        \\  ret
+    ,
+        "1\n0\n",
+    );
+}
+
+test "a recursion with no end runs out of frame memory" {
+    try expectSourceTrap(
+        \\entry start
+        \\start:
+        \\  call forever
+        \\  halt
+        \\forever:
+        \\  enter 0 8
+        \\  call forever
+        \\  ret
+    ,
+        error.CallStackOverflow,
+        "",
+    );
+}
+
+test "enter outside a call is refused" {
+    // The entry point is not called, so it has no frame to enter. A function with
+    // locals is reached with `call`, and the entry point is a stub that calls it.
+    try expectSourceTrap(
+        \\  enter 0 1
+        \\  halt
+    ,
+        error.EnterOutsideCall,
+        "",
+    );
+}
+
 test "the assembler and the VM divide the address checks between them" {
     // The assembler does not know the size of the memory of the VM that will run the
     // program, so it accepts this operand. The VM knows that size, so its own

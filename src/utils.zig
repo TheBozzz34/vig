@@ -113,3 +113,22 @@ pub fn readU32(self: *machine.VM) !u32 {
     self.ip += 4;
     return value;
 }
+
+// Read an unsigned 16-bit operand. The frame instructions index a slot, and a frame
+// never has enough slots to need a wider operand.
+pub fn readU16(self: *machine.VM) !u16 {
+    if (self.ip > self.code_len or self.code_len - self.ip < 2) {
+        return error.SegmentFault;
+    }
+
+    const value = std.mem.readInt(u16, self.memory[self.ip..][0..2], .little);
+    self.ip += 2;
+    return value;
+}
+
+// Read the operand of `enter`: the arguments of a function and then its locals.
+pub fn readFrameShape(self: *machine.VM) !bytecode.encode.FrameShape {
+    const arguments = try readU16(self);
+    const locals = try readU16(self);
+    return .{ .arguments = arguments, .locals = locals };
+}
