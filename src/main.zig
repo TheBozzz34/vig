@@ -18,7 +18,12 @@ pub fn main(init: std.process.Init) !void {
     var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     defer stdout.interface.flush() catch {};
 
-    var vm = machine.VM.init(&stdout.interface);
+    // Runtime input comes from stdin. A separate buffer lets `read_i32` consume
+    // input incrementally from a terminal, pipe, or redirected file.
+    var stdin_buffer: [4096]u8 = undefined;
+    var stdin = Io.File.stdin().readerStreaming(init.io, &stdin_buffer);
+
+    var vm = machine.VM.init(&stdin.interface, &stdout.interface);
     defer vm.deinit();
     std.log.info("VM initialized successfully.", .{});
 

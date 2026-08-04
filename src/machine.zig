@@ -40,6 +40,10 @@ pub const VM = struct {
     // output of the program.
     output: *Io.Writer,
 
+    // The source for `read_i32`. Like output, this is injected so a caller can
+    // connect stdin while a test supplies deterministic in-memory input.
+    input: *Io.Reader,
+
     // The location at which the verifier refused the last program. The VM holds
     // this value and writes no message. Therefore the caller can write its own
     // message.
@@ -68,10 +72,9 @@ pub const VM = struct {
         self.clearForeignImports();
     }
 
-    // Make a VM that has the default values. `output` receives the output of the
-    // program. It must stay in existence longer than the VM. `reset` does not
-    // change it.
-    pub fn init(output: *Io.Writer) VM {
+    // Make a VM that has the default values. The streams must stay in existence
+    // longer than the VM. `reset` does not change them.
+    pub fn init(input: *Io.Reader, output: *Io.Writer) VM {
         return .{
             .memory = @splat(0),
             .stack = @splat(0),
@@ -83,6 +86,7 @@ pub const VM = struct {
             .code_len = 0,
             .program_len = 0,
             .verification_failure = null,
+            .input = input,
             .output = output,
             .sp = 0,
             .ip = 0,
@@ -372,8 +376,108 @@ pub const VM = struct {
                     self.sp -= 2;
                     self.data[address] = value;
                 },
+                .@"and" => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] &= self.stack[self.sp];
+                },
+                .@"or" => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] |= self.stack[self.sp];
+                },
+                .xor => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] ^= self.stack[self.sp];
+                },
+                .not => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    self.stack[self.sp - 1] = ~self.stack[self.sp - 1];
+                },
+                .shl => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    const value: u32 = @bitCast(self.stack[self.sp - 2]);
+                    const count: u5 = @truncate(@as(u32, @bitCast(self.stack[self.sp - 1])));
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = @bitCast(value << count);
+                },
+                .shr_u => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    const value: u32 = @bitCast(self.stack[self.sp - 2]);
+                    const count: u5 = @truncate(@as(u32, @bitCast(self.stack[self.sp - 1])));
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = @bitCast(value >> count);
+                },
+                .rotl => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    const value: u32 = @bitCast(self.stack[self.sp - 2]);
+                    const count: u5 = @truncate(@as(u32, @bitCast(self.stack[self.sp - 1])));
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = @bitCast(std.math.rotl(u32, value, count));
+                },
+                .add_wrap => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] +%= self.stack[self.sp];
+                },
+                .read_i32 => {
+                    // Do not consume input when there is nowhere to put the
+                    // result.
+                    if (self.sp >= self.stack.len) return error.StackOverflow;
+                    self.stack[self.sp] = try self.readI32();
+                    self.sp += 1;
+                },
             }
         }
+    }
+
+    // Read one whitespace-delimited signed decimal integer. Output is flushed
+    // first so an interactive prompt is visible before the VM blocks on stdin.
+    fn readI32(self: *VM) !i32 {
+        try self.output.flush();
+
+        var byte: u8 = undefined;
+        while (true) {
+            byte = self.input.peekByte() catch |err| return switch (err) {
+                error.EndOfStream => error.EndOfInput,
+                error.ReadFailed => error.InputReadFailed,
+            };
+            if (!std.ascii.isWhitespace(byte)) break;
+            _ = self.input.takeByte() catch unreachable;
+        }
+
+        const negative = byte == '-';
+        if (negative or byte == '+') {
+            _ = self.input.takeByte() catch unreachable;
+            byte = self.input.peekByte() catch |err| return switch (err) {
+                error.EndOfStream => error.InvalidInput,
+                error.ReadFailed => error.InputReadFailed,
+            };
+        }
+        if (!std.ascii.isDigit(byte)) return error.InvalidInput;
+
+        const limit: u32 = if (negative) 2147483648 else 2147483647;
+        var magnitude: u32 = 0;
+        while (true) {
+            byte = self.input.peekByte() catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return error.InputReadFailed,
+            };
+            if (!std.ascii.isDigit(byte)) {
+                if (!std.ascii.isWhitespace(byte)) return error.InvalidInput;
+                break;
+            }
+
+            const digit: u32 = byte - '0';
+            if (magnitude > (limit - digit) / 10) return error.IntegerOverflow;
+            magnitude = magnitude * 10 + digit;
+            _ = self.input.takeByte() catch unreachable;
+        }
+
+        if (!negative) return @intCast(magnitude);
+        if (magnitude == 2147483648) return std.math.minInt(i32);
+        return -@as(i32, @intCast(magnitude));
     }
 
     // Check a data-segment address from the stack. A negative value has no
@@ -491,20 +595,27 @@ pub const VM = struct {
 // A VM and the buffer that collects the output of its program. Therefore a test
 // can check what the program printed.
 const Harness = struct {
+    input: Io.Reader,
     collected: Io.Writer.Allocating,
     vm: VM,
 
     fn init() Harness {
+        return initWithInput("");
+    }
+
+    fn initWithInput(input: []const u8) Harness {
         return .{
+            .input = .fixed(input),
             .collected = .init(std.testing.allocator),
-            // `start` sets `vm.output` after the structure has its final
-            // address. A pointer from this position becomes invalid when the
-            // function gives a copy of the structure to the caller.
-            .vm = VM.init(undefined),
+            // `start` sets the stream pointers after the structure has its
+            // final address. Pointers from this position become invalid when
+            // the function gives a copy of the structure to the caller.
+            .vm = VM.init(undefined, undefined),
         };
     }
 
     fn start(self: *Harness) void {
+        self.vm.input = &self.input;
         self.vm.output = &self.collected.writer;
     }
 
@@ -528,6 +639,26 @@ fn expectOutput(program: []const u8, expected: []const u8) !void {
     try harness.vm.loadProgram(program);
     try harness.vm.run();
     try std.testing.expectEqualStrings(expected, harness.written());
+}
+
+fn expectOutputWithInput(program: []const u8, input: []const u8, expected: []const u8) !void {
+    var harness = Harness.initWithInput(input);
+    defer harness.deinit();
+    harness.start();
+
+    try harness.vm.loadProgram(program);
+    try harness.vm.run();
+    try std.testing.expectEqualStrings(expected, harness.written());
+}
+
+fn expectInputTrap(input: []const u8, expected_error: anyerror) !void {
+    var harness = Harness.initWithInput(input);
+    defer harness.deinit();
+    harness.start();
+
+    try harness.vm.loadProgram(&[_]u8{ opByte(.read_i32), opByte(.halt) });
+    try std.testing.expectError(expected_error, harness.vm.run());
+    try std.testing.expectEqual(@as(usize, 0), harness.vm.sp);
 }
 
 // The same as `expectOutput`, but the program must trap. The test also compares
@@ -757,6 +888,28 @@ test "print writes program output to the injected writer" {
     try expectOutput(&(push(42) ++ [_]u8{ opByte(.print), opByte(.halt) }), "42\n");
 }
 
+test "read_i32 reads signed decimal values from runtime input" {
+    const read_and_print = [_]u8{ opByte(.read_i32), opByte(.print), opByte(.pop) };
+    const program = read_and_print ++ read_and_print ++ read_and_print ++
+        read_and_print ++ read_and_print ++ [_]u8{opByte(.halt)};
+
+    try expectOutputWithInput(
+        &program,
+        " \t+42\n-17 0 2147483647 -2147483648",
+        "42\n-17\n0\n2147483647\n-2147483648\n",
+    );
+}
+
+test "read_i32 distinguishes end, malformed input, and overflow" {
+    try expectInputTrap("", error.EndOfInput);
+    try expectInputTrap("  \r\n\t", error.EndOfInput);
+    try expectInputTrap("+", error.InvalidInput);
+    try expectInputTrap("nope", error.InvalidInput);
+    try expectInputTrap("12x", error.InvalidInput);
+    try expectInputTrap("2147483648", error.IntegerOverflow);
+    try expectInputTrap("-2147483649", error.IntegerOverflow);
+}
+
 test "arithmetic operates on the top two values" {
     // Each case leaves one value on the stack and prints it.
     const cases = [_]struct { code: bytecode.OpCode, a: i32, b: i32, expected: []const u8 }{
@@ -773,6 +926,20 @@ test "arithmetic operates on the top two values" {
             [_]u8{ opByte(case.code), opByte(.print), opByte(.halt) };
         try expectOutput(&program, case.expected);
     }
+}
+
+test "bitwise, shift, rotate, and wrapping operations use 32-bit patterns" {
+    const program =
+        push(0b1100) ++ push(0b1010) ++ [_]u8{ opByte(.@"and"), opByte(.print), opByte(.pop) } ++
+        push(0b1100) ++ push(0b1010) ++ [_]u8{ opByte(.@"or"), opByte(.print), opByte(.pop) } ++
+        push(0b1100) ++ push(0b1010) ++ [_]u8{ opByte(.xor), opByte(.print), opByte(.pop) } ++
+        push(0) ++ [_]u8{ opByte(.not), opByte(.print), opByte(.pop) } ++
+        push(1) ++ push(33) ++ [_]u8{ opByte(.shl), opByte(.print), opByte(.pop) } ++
+        push(-1) ++ push(1) ++ [_]u8{ opByte(.shr_u), opByte(.print), opByte(.pop) } ++
+        push(0x40000001) ++ push(1) ++ [_]u8{ opByte(.rotl), opByte(.print), opByte(.pop) } ++
+        push(std.math.maxInt(i32)) ++ push(1) ++ [_]u8{ opByte(.add_wrap), opByte(.print), opByte(.halt) };
+
+    try expectOutput(&program, "8\n14\n6\n-1\n2\n2147483647\n-2147483646\n-2147483648\n");
 }
 
 test "comparisons push 1 or 0" {

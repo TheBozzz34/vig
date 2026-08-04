@@ -24,7 +24,7 @@ decode, every branch must land on an instruction boundary, and control must not
 fall off the end of the code. A rejected program reports the code offset that
 failed and does not execute at all.
 
-## Output streams
+## Runtime I/O
 
 `print` and `print_string` write to **stdout**. The VM's own diagnostics go to **stderr**, so program output can
 be redirected on its own:
@@ -35,6 +35,18 @@ vig.exe program.vig > output.txt
 
 Program output is buffered and flushed when execution ends, including when a
 program traps, so anything printed before a trap is not lost.
+
+`read_i32` reads a whitespace-delimited signed decimal integer from **stdin**
+and pushes it onto the data stack. Input can be typed interactively or supplied
+through a pipe or redirected file:
+
+```powershell
+"20" | vig.exe double.vig
+vig.exe program.vig < input.txt
+```
+
+Before waiting for input, the VM flushes stdout so a prompt printed by the
+program is visible.
 
 ## Foreign calls
 

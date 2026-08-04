@@ -47,7 +47,7 @@ test "file loader permits a full memory image behind a container header" {
     );
     defer std.testing.allocator.free(path);
 
-    var vm = machine.VM.init(undefined);
+    var vm = machine.VM.init(undefined, undefined);
     defer vm.deinit();
     try loadProgramFromFile(&vm, std.testing.io, std.testing.allocator, path);
     try std.testing.expectEqual(constants.memory_size, vm.program_len);
