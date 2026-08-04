@@ -9,43 +9,47 @@ const verify = bytecode.verify;
 const Io = std.Io;
 
 pub const VM = struct {
-    // memory and stack, arrays of bytes and ints
+    // The memory and the stack: an array of bytes and an array of integers.
     memory: [constants.memory_size]u8,
     stack: [constants.stack_size]i32,
 
-    // data segment for load and store ops
+    // The data segment for the `load` and `store` instructions.
     data: [constants.data_size]i32,
 
-    // data segment for call and return ops
+    // The call stack for the `call` and `ret` instructions.
     call_stack: [constants.call_stack_size]usize,
     csp: usize,
 
     foreign_imports: [bytecode.foreign.max_imports]?foreign.Import,
     foreign_import_count: usize,
 
-    // Bytes of executable instructions at the start of memory. Execution and
-    // every jump target are bounded by this, so static data cannot be executed.
+    // The number of bytes of executable instructions at the start of the memory.
+    // Execution and each jump target must stay inside this length. Therefore the
+    // VM cannot execute the static data.
     code_len: usize = 0,
 
-    // Bytes the whole program image occupies: the code region followed by the
-    // static-data region. Addresses a program pushes are bounded by this, which
-    // is what lets `print_string` and `cstr` arguments reach static data.
+    // The number of bytes in the complete program image: the code region, then
+    // the static-data region. An address from the program must stay inside this
+    // length. Therefore `print_string` and a `cstr` argument can use the static
+    // data.
     program_len: usize = 0,
 
-    // Where `print` and `print_string` send program output. Host diagnostics
-    // still go to std.log; this is the guest program's own stdout, so it stays
-    // separable from the VM's own chatter and can be captured in tests.
+    // The destination for the output of `print` and `print_string`. This writer
+    // is the stdout of the guest program. The diagnostic messages of the host go
+    // to `std.log`. Therefore the two are apart, and a test can collect the
+    // output of the program.
     output: *Io.Writer,
 
-    // Where verification rejected the last program that failed to load. The VM
-    // keeps it instead of logging so the caller can report it in its own voice.
+    // The location at which the verifier refused the last program. The VM holds
+    // this value and writes no message. Therefore the caller can write its own
+    // message.
     verification_failure: ?verify.Failure = null,
 
-    // Pointers/Registers
-    ip: usize = 0, // Instruction Pointer
-    sp: usize = 0, // Stack Pointer
+    // The registers.
+    ip: usize = 0, // the instruction pointer
+    sp: usize = 0, // the stack pointer
 
-    // reset vm state
+    // Set the state of the VM to its initial values.
     pub fn reset(self: *VM) void {
         self.clearForeignImports();
         @memset(&self.stack, 0);
@@ -64,8 +68,9 @@ pub const VM = struct {
         self.clearForeignImports();
     }
 
-    // initialize the VM with default values. `output` receives program output
-    // and must outlive the VM; `reset` deliberately leaves it alone.
+    // Make a VM that has the default values. `output` receives the output of the
+    // program. It must stay in existence longer than the VM. `reset` does not
+    // change it.
     pub fn init(output: *Io.Writer) VM {
         return .{
             .memory = @splat(0),
@@ -84,8 +89,9 @@ pub const VM = struct {
         };
     }
 
-    // Load a program into the VM's memory. The file may be a current container,
-    // a version 1 container, or bare code; `container.parse` tells them apart.
+    // Load a program into the memory of the VM. The file can be a current
+    // container, a version 1 container, or bare code with no header.
+    // `container.parse` finds which form the file has.
     pub fn loadProgram(self: *VM, program: []const u8) !void {
         self.reset();
         errdefer self.clearForeignImports();
@@ -93,10 +99,10 @@ pub const VM = struct {
         const image = try container.parse(program);
         if (image.imageLen() > self.memory.len) return error.ProgramTooLarge;
 
-        // Only the current format separates code from static data, which is what
-        // the verifier needs in order to walk instructions without decoding
-        // strings. Older programs still run under the per-instruction checks in
-        // `run`.
+        // Only the current format keeps the code apart from the static data. The
+        // verifier needs this split to read the instructions and to decode no
+        // string. An older program runs with the checks in `run` on each
+        // instruction.
         if (image.kind.separatesData()) try self.verifyImage(image);
 
         try self.loadForeignImports(image);
@@ -109,28 +115,28 @@ pub const VM = struct {
         self.ip = image.header.entry_point;
     }
 
-    // loop through instructions in memory, fetch, decode, and execute them
+    // Read each instruction in the memory. Decode it, then execute it.
     pub fn run(self: *VM) !void {
         while (self.ip < self.code_len) {
-            // Fetch the next instruction
+            // Read the next instruction.
             const raw_op = self.memory[self.ip];
 
-            // Decode the instruction into an enum
+            // Decode the instruction to an enum value.
             const op = bytecode.OpCode.fromByte(raw_op) catch {
-                // Written straight to stderr rather than through std.log: a trap
-                // is the program's fault, not a host-level error, and tests that
-                // exercise traps should not read as failing runs.
+                // This message goes directly to stderr and not to `std.log`. A
+                // trap is a fault in the program and not an error in the host. A
+                // test of a trap must not look like a test that failed.
                 std.debug.print("Invalid OpCode 0x{x:0>2} at code offset {d}\n", .{ raw_op, self.ip });
                 return error.InvalidInstruction;
             };
             self.ip += 1;
 
-            // switch on enum
+            // Select the operation for this opcode.
             switch (op) {
                 .halt => return,
 
                 .push => {
-                    // Fetch next 4 bytes as an i32 operand
+                    // Read the next 4 bytes as an i32 operand.
                     if (self.code_len - self.ip < 4) return error.SegmentFault;
                     const value = std.mem.readInt(i32, self.memory[self.ip..][0..4], .little);
                     self.ip += 4;
@@ -210,7 +216,7 @@ pub const VM = struct {
 
                     if (b == 0) return error.DivisionByZero;
 
-                    // minInt / -1 cannot fit in i32.
+                    // The result of minInt / -1 is too large for an i32.
                     if (a == std.math.minInt(i32) and b == -1) {
                         return error.IntegerOverflow;
                     }
@@ -349,8 +355,9 @@ pub const VM = struct {
                     try self.output.print("{s}\n", .{string});
                 },
                 .load_at => {
-                    // Unlike `load`, the address comes from the stack, so data
-                    // addresses can be computed at runtime.
+                    // The address comes from the stack, and not from the operand
+                    // of `load`. Therefore the program can calculate a data
+                    // address while it runs.
                     if (self.sp == 0) return error.StackUnderflow;
 
                     const address = try self.dataAddress(self.stack[self.sp - 1]);
@@ -369,8 +376,9 @@ pub const VM = struct {
         }
     }
 
-    // Validate a stack-supplied data-segment address. Negative values cannot be
-    // folded into the unsigned range, so they fault rather than wrap.
+    // Check a data-segment address from the stack. A negative value has no
+    // unsigned equivalent. Therefore a negative value gives a fault. It does not
+    // become a large positive value.
     fn dataAddress(self: *VM, value: i32) !usize {
         if (value < 0) return error.SegmentFault;
         const address: usize = @intCast(value);
@@ -386,9 +394,9 @@ pub const VM = struct {
         self.foreign_import_count = 0;
     }
 
-    // Resolve every declaration in the container's import table to a library and
-    // symbol address. The container reader has already bounded the table and the
-    // import count, so this only has to do the resolving.
+    // Find the library address and the symbol address for each declaration in
+    // the import table of the container. The container reader has already checked
+    // the size of the table and the import count.
     fn loadForeignImports(self: *VM, image: container.Image) !void {
         std.debug.assert(image.header.import_count <= self.foreign_imports.len);
 
@@ -403,11 +411,11 @@ pub const VM = struct {
         }
     }
 
-    // Prove the code region is safe to execute before any of it runs: see the
-    // vig-bytecode verifier for what that covers.
+    // Make sure that the code region is safe to execute before the VM runs any of
+    // it. The vig-bytecode verifier gives the list of the checks.
     fn verifyImage(self: *VM, image: container.Image) !void {
-        // One mark per code byte. The image has already been checked against the
-        // size of VM memory.
+        // One mark for each code byte. The VM has already checked the image
+        // against the size of the VM memory.
         var scratch: [constants.memory_size]verify.Mark = undefined;
 
         var failure: verify.Failure = undefined;
@@ -455,8 +463,9 @@ pub const VM = struct {
         };
     }
 
-    // Guest pointers are offsets into the whole program image, code and static
-    // data alike, so a program can pass a string it declared with `asciiz`.
+    // A guest pointer is an offset into the complete program image. That image
+    // includes the code and the static data. Therefore a program can give a
+    // string that it declared with `asciiz`.
     fn guestPointer(self: *VM, value: i32, require_terminator: bool) !usize {
         if (value == 0) return 0;
         if (value < 0) return error.InvalidGuestPointer;
@@ -479,8 +488,8 @@ pub const VM = struct {
 
 // Test harness ---------------------------------------------------------------
 
-// A VM plus the buffer its program output is collected into, so tests can
-// assert on what a program actually printed.
+// A VM and the buffer that collects the output of its program. Therefore a test
+// can check what the program printed.
 const Harness = struct {
     collected: Io.Writer.Allocating,
     vm: VM,
@@ -488,8 +497,9 @@ const Harness = struct {
     fn init() Harness {
         return .{
             .collected = .init(std.testing.allocator),
-            // `vm.output` is patched in `start` once the struct has its final
-            // address; taking it here would dangle after the copy is returned.
+            // `start` sets `vm.output` after the structure has its final
+            // address. A pointer from this position becomes invalid when the
+            // function gives a copy of the structure to the caller.
             .vm = VM.init(undefined),
         };
     }
@@ -508,7 +518,8 @@ const Harness = struct {
     }
 };
 
-// Assemble-free golden test: run `program` and assert on its exact output.
+// Run `program` and compare its output with the exact expected output. This test
+// does not use the assembler.
 fn expectOutput(program: []const u8, expected: []const u8) !void {
     var harness = Harness.init();
     defer harness.deinit();
@@ -519,8 +530,9 @@ fn expectOutput(program: []const u8, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, harness.written());
 }
 
-// As above, but the program is expected to trap. Output printed before the trap
-// is still asserted, since a trap should not discard prior side effects.
+// The same as `expectOutput`, but the program must trap. The test also compares
+// the output from before the trap, because a trap must not remove an earlier
+// effect.
 fn expectTrap(program: []const u8, expected_error: anyerror, expected_output: []const u8) !void {
     var harness = Harness.init();
     defer harness.deinit();
@@ -535,7 +547,7 @@ fn opByte(code: bytecode.OpCode) u8 {
     return @intFromEnum(code);
 }
 
-// Encode `push value` so test programs stay readable.
+// Encode `push value`. This function keeps a test program easy to read.
 fn push(value: i32) [5]u8 {
     var bytes: [5]u8 = undefined;
     bytes[0] = opByte(.push);
@@ -543,7 +555,7 @@ fn push(value: i32) [5]u8 {
     return bytes;
 }
 
-// Encode an instruction taking a 4-byte address/target operand.
+// Encode an instruction that has a 4-byte address operand or target operand.
 fn withAddress(code: bytecode.OpCode, address: u32) [5]u8 {
     var bytes: [5]u8 = undefined;
     bytes[0] = opByte(code);
@@ -551,8 +563,8 @@ fn withAddress(code: bytecode.OpCode, address: u32) [5]u8 {
     return bytes;
 }
 
-// Lay out a current-format container in memory, so the loader is exercised the
-// same way an assembled program exercises it.
+// Make a container in the current format in memory. Then the test uses the loader
+// in the same way as an assembled program.
 fn buildContainer(layout: container.Layout) ![]u8 {
     const bytes = try std.testing.allocator.alloc(u8, try container.encodedSize(layout));
     errdefer std.testing.allocator.free(bytes);
@@ -577,8 +589,8 @@ test "execution stops at the loaded program boundary" {
     };
     try vm.loadProgram(&program);
 
-    // This would be executed as an invalid instruction if run used the VM's
-    // total memory size instead of code_len.
+    // If `run` used the total size of the VM memory in place of `code_len`, the
+    // VM would execute this byte as an unknown instruction.
     vm.memory[program.len] = 0xff;
 
     try vm.run();
@@ -593,8 +605,9 @@ test "a container starts at its entry point and maps static data after the code"
     harness.start();
     const vm = &harness.vm;
 
-    // A prologue the entry point skips, then the program proper. The string lives
-    // in the static-data region, so its address is the code length.
+    // First a prologue that the entry point goes past, then the program itself.
+    // The string is in the static-data region. Therefore its address is the length
+    // of the code.
     const prologue = push(111) ++ [_]u8{opByte(.halt)};
     const greeting = 13;
     const code = prologue ++ push(greeting) ++ [_]u8{ opByte(.print_string), opByte(.halt) };
@@ -614,7 +627,7 @@ test "a container starts at its entry point and maps static data after the code"
 
     try vm.run();
     try std.testing.expectEqualStrings("hello\n", harness.written());
-    // The prologue never ran, so its value is not on the stack.
+    // The prologue did not run. Therefore its value is not on the stack.
     try std.testing.expectEqual(@as(usize, 1), vm.sp);
     try std.testing.expectEqual(@as(i32, greeting), vm.stack[0]);
 }
@@ -624,7 +637,7 @@ test "static data is never executed, whatever it decodes to" {
     defer harness.deinit();
     harness.start();
 
-    // A byte that is not a valid opcode, immediately after the code region.
+    // A byte that is not an opcode, directly after the code region.
     const program = try buildContainer(.{ .code = &[_]u8{opByte(.halt)}, .data = &[_]u8{0xfe} });
     defer std.testing.allocator.free(program);
 
@@ -640,14 +653,15 @@ test "a container is verified before any of it runs" {
     harness.start();
     const vm = &harness.vm;
 
-    // `jmp` into the static-data region: a valid file, but not a valid program.
+    // A `jmp` into the static-data region. The file is correct, but the program
+    // is not.
     const code = withAddress(.jmp, 6) ++ [_]u8{opByte(.halt)};
     const program = try buildContainer(.{ .code = &code, .data = "x\x00" });
     defer std.testing.allocator.free(program);
 
     try std.testing.expectError(error.TargetOutOfRange, vm.loadProgram(program));
     try std.testing.expectEqual(@as(usize, 0), vm.verification_failure.?.offset);
-    // Nothing was loaded, so nothing can run.
+    // The VM loaded no program. Therefore it can run no instruction.
     try std.testing.expectEqual(@as(usize, 0), vm.code_len);
     try vm.run();
     try std.testing.expectEqualStrings("", harness.written());
@@ -670,13 +684,14 @@ test "bare code and version 1 containers still load" {
     harness.start();
     const vm = &harness.vm;
 
-    // Headerless code, as the first VIG programs were written.
+    // Code with no header, as in the first VIG programs.
     try vm.loadProgram(&(push(1) ++ [_]u8{ opByte(.print), opByte(.halt) }));
     try vm.run();
     try std.testing.expectEqualStrings("1\n", harness.written());
 
-    // A version 1 container: no code/data split, so the string sits inside the
-    // code region at offset 7 and the program is not verified.
+    // A version 1 container has no split of the code from the data. Therefore the
+    // string is in the code region at offset 7, and no verifier checks the
+    // program.
     const legacy = "VIGF" ++ [_]u8{ 1, 0 } ++
         push(7) ++ [_]u8{ opByte(.print_string), opByte(.halt) } ++ "again\x00";
     try vm.loadProgram(legacy);
@@ -748,7 +763,7 @@ test "arithmetic operates on the top two values" {
         .{ .code = .add, .a = 7, .b = 5, .expected = "12\n" },
         .{ .code = .sub, .a = 7, .b = 5, .expected = "2\n" },
         .{ .code = .mul, .a = 7, .b = 5, .expected = "35\n" },
-        // Truncated toward zero, not floored.
+        // The division truncates toward zero. It does not round down.
         .{ .code = .div, .a = -7, .b = 2, .expected = "-3\n" },
         .{ .code = .mod, .a = -7, .b = 2, .expected = "-1\n" },
     };
@@ -778,12 +793,12 @@ test "comparisons push 1 or 0" {
 }
 
 test "stack manipulation reorders and discards values" {
-    // dup then print twice: 1 1
+    // `dup`, then `print` two times: 1 1
     try expectOutput(
         &(push(1) ++ [_]u8{ opByte(.dup), opByte(.print), opByte(.pop), opByte(.print), opByte(.halt) }),
         "1\n1\n",
     );
-    // swap brings the lower value back to the top: 2 then 1
+    // `swap` moves the lower value to the top. The prints then give 1, then 2.
     try expectOutput(
         &(push(1) ++ push(2) ++ [_]u8{ opByte(.swap), opByte(.print), opByte(.pop), opByte(.print), opByte(.halt) }),
         "1\n2\n",
@@ -791,13 +806,13 @@ test "stack manipulation reorders and discards values" {
 }
 
 test "conditional jumps consume their condition" {
-    // jmp_zero with a zero condition skips the first print.
+    // With a condition of 0, `jmp_zero` goes past the first `push`.
     const taken = push(0) ++ withAddress(.jmp_zero, 15) ++
-        push(111) ++ // skipped
+        push(111) ++ // the VM does not run this
         push(222) ++ [_]u8{ opByte(.print), opByte(.halt) };
     try expectOutput(&taken, "222\n");
 
-    // A non-zero condition falls through instead.
+    // With a condition that is not 0, the VM continues at the next instruction.
     const not_taken = push(1) ++ withAddress(.jmp_zero, 15) ++
         push(111) ++ [_]u8{ opByte(.print), opByte(.halt) };
     try expectOutput(&not_taken, "111\n");
@@ -818,7 +833,8 @@ test "load and store move values through the data segment" {
 }
 
 test "load_at and store_at address the data segment at runtime" {
-    // data[4] = 77 via a computed address (2 + 2), then read it back the same way.
+    // Put 77 into data[4] with a calculated address (2 + 2). Then read it in the
+    // same way.
     const program = push(77) ++ push(2) ++ push(2) ++ [_]u8{opByte(.add)} ++
         [_]u8{opByte(.store_at)} ++
         push(4) ++ [_]u8{ opByte(.load_at), opByte(.print), opByte(.halt) };
@@ -839,7 +855,8 @@ test "store_at consumes both the value and the address" {
 }
 
 test "indirect addressing walks an array in the data segment" {
-    // data[0..3] = {10, 20, 30}, then sum them with a computed-address loop.
+    // Put 10, 20 and 30 into data[0..3]. Then add them in a loop that calculates
+    // each address.
     var program = std.ArrayList(u8).empty;
     defer program.deinit(std.testing.allocator);
 
@@ -848,25 +865,25 @@ test "indirect addressing walks an array in the data segment" {
         try program.appendSlice(std.testing.allocator, &withAddress(.store, index));
     }
 
-    // data[100] = running total, data[101] = cursor
+    // data[100] holds the total. data[101] holds the index.
     try program.appendSlice(std.testing.allocator, &push(0));
     try program.appendSlice(std.testing.allocator, &withAddress(.store, 100));
     try program.appendSlice(std.testing.allocator, &push(0));
     try program.appendSlice(std.testing.allocator, &withAddress(.store, 101));
 
     const loop_start: u32 = @intCast(program.items.len);
-    // total += data[cursor]
+    // total = total + data[index]
     try program.appendSlice(std.testing.allocator, &withAddress(.load, 100));
     try program.appendSlice(std.testing.allocator, &withAddress(.load, 101));
     try program.append(std.testing.allocator, opByte(.load_at));
     try program.append(std.testing.allocator, opByte(.add));
     try program.appendSlice(std.testing.allocator, &withAddress(.store, 100));
-    // cursor += 1
+    // index = index + 1
     try program.appendSlice(std.testing.allocator, &withAddress(.load, 101));
     try program.appendSlice(std.testing.allocator, &push(1));
     try program.append(std.testing.allocator, opByte(.add));
     try program.appendSlice(std.testing.allocator, &withAddress(.store, 101));
-    // loop while cursor != 3
+    // Continue the loop while the index is not 3.
     try program.appendSlice(std.testing.allocator, &withAddress(.load, 101));
     try program.appendSlice(std.testing.allocator, &push(3));
     try program.append(std.testing.allocator, opByte(.ne));
@@ -880,7 +897,7 @@ test "indirect addressing walks an array in the data segment" {
 }
 
 test "traps report the failure and keep output printed before it" {
-    // Division by zero, after a successful print.
+    // A division by zero, after a print that worked.
     try expectTrap(
         &(push(1) ++ [_]u8{ opByte(.print), opByte(.pop) } ++ push(1) ++ push(0) ++ [_]u8{opByte(.div)}),
         error.DivisionByZero,
@@ -891,7 +908,7 @@ test "traps report the failure and keep output printed before it" {
         error.IntegerOverflow,
         "",
     );
-    // minInt / -1 has no i32 representation.
+    // The result of minInt / -1 is too large for an i32.
     try expectTrap(
         &(push(std.math.minInt(i32)) ++ push(-1) ++ [_]u8{opByte(.div)}),
         error.IntegerOverflow,
@@ -899,12 +916,14 @@ test "traps report the failure and keep output printed before it" {
     );
     try expectTrap(&[_]u8{ opByte(.add), opByte(.halt) }, error.StackUnderflow, "");
     try expectTrap(&[_]u8{ opByte(.ret), opByte(.halt) }, error.CallStackUnderflow, "");
-    // An unmapped opcode byte is rejected rather than skipped.
+    // The VM gives an error for an opcode byte that has no instruction. It does
+    // not go past the byte.
     try expectTrap(&[_]u8{0xfe}, error.InvalidInstruction, "");
 }
 
 test "indirect addressing faults outside the data segment" {
-    // data_size is 256, so 256 and any negative address are out of range.
+    // `data_size` is 256. Therefore 256 and each negative address are outside the
+    // segment.
     try expectTrap(&(push(256) ++ [_]u8{ opByte(.load_at), opByte(.halt) }), error.SegmentFault, "");
     try expectTrap(&(push(-1) ++ [_]u8{ opByte(.load_at), opByte(.halt) }), error.SegmentFault, "");
     try expectTrap(

@@ -6,14 +6,14 @@ const utils = @import("utils.zig");
 pub fn main(init: std.process.Init) !void {
     std.log.info("Starting VIG", .{});
 
-    // This is appropriate for anything that lives as long as the process.
+    // Use this allocator for data that stays for the full life of the process.
     const arena: std.mem.Allocator = init.arena.allocator();
 
-    // Accessing command line arguments:
+    // Read the command-line arguments.
     const args = try init.minimal.args.toSlice(arena);
 
-    // Program output goes to real stdout so it can be piped and redirected,
-    // separately from the std.log diagnostics on stderr.
+    // The output of the program goes to stdout. Therefore a user can send it to
+    // a pipe or to a file. The `std.log` diagnostic messages go to stderr.
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     defer stdout.interface.flush() catch {};
@@ -53,7 +53,8 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("============= VM OUTPUT =============", .{});
 
     vm.run() catch |err| {
-        // Flush first so partial program output precedes the error on stderr.
+        // Flush the output first. Then the output of the program comes before
+        // the error message on stderr.
         stdout.interface.flush() catch {};
         std.log.err("VM execution failed: {s}", .{@errorName(err)});
         return err;

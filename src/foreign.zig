@@ -3,17 +3,17 @@ const builtin = @import("builtin");
 const bytecode = @import("vig_bytecode");
 const ffi = @import("ffi");
 
-// Foreign function interface for VIG. This is a minimal implementation that
-// only supports Windows x64 integer/pointer calls.  This is enough to call
-// simple Windows APIs
+// The foreign function interface for VIG. This is a small implementation. It
+// makes only a Windows x64 call that has integer arguments and pointer
+// arguments. Such a call is sufficient for a simple Windows API function.
 
-// The argument types and the ABI limits are part of the container format, so
-// they come from the shared package rather than being restated here.
+// The argument types and the ABI limits are part of the container format. This
+// module takes them from the shared package. It does not declare them again.
 const limits = bytecode.foreign;
 pub const ArgType = limits.ArgType;
 
-// A foreign import once its library and symbol have been resolved to addresses.
-// The declaration it was resolved from is `bytecode.foreign.Import`.
+// A foreign import after the VM finds the addresses of its library and its
+// symbol. The declaration for this import is a `bytecode.foreign.Import`.
 pub const Import = struct {
     library: *anyopaque,
     address: *const anyopaque,
@@ -21,18 +21,19 @@ pub const Import = struct {
     arg_types: [limits.max_args]ArgType,
 };
 
-// Neccessary Windows API functions for dynamic library loading and symbol resolution
+// The Windows API functions that load a library and find a symbol.
 extern "kernel32" fn LoadLibraryA(library_name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetProcAddress(library: *anyopaque, symbol_name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
 extern "kernel32" fn FreeLibrary(library: *anyopaque) callconv(.winapi) i32;
 
-// Resolve a foreign function import by loading the specified library and looking up the symbol address. Returns an Import struct on success.
+// Load the given library and find the address of the symbol. If there is no
+// error, the function gives an `Import` structure.
 pub fn resolve(library_name: []const u8, symbol_name: []const u8, arg_types: []const ArgType) !Import {
 
-    // Foreign calls are only supported on Windows for now
+    // At this time, a foreign call is possible only on Windows.
     if (builtin.os.tag != .windows) return error.ForeignCallsUnsupported;
 
-    // Validate input parameters
+    // Check the input parameters.
     if (library_name.len == 0 or symbol_name.len == 0) return error.InvalidForeignImport;
     if (symbol_name.len > limits.max_name_len or arg_types.len > limits.max_args) return error.InvalidForeignImport;
 
@@ -42,7 +43,7 @@ pub fn resolve(library_name: []const u8, symbol_name: []const u8, arg_types: []c
     @memcpy(library_z[0..library_name.len], library_name);
     library_z[library_name.len] = 0;
 
-    // Load the library and get the symbol address
+    // Load the library and find the address of the symbol.
     const library = LoadLibraryA(library_z[0..library_name.len :0].ptr) orelse return error.ForeignLibraryNotFound;
     errdefer _ = FreeLibrary(library);
 
@@ -66,7 +67,7 @@ pub fn resolve(library_name: []const u8, symbol_name: []const u8, arg_types: []c
     };
 }
 
-// free loaded library
+// Release the library.
 pub fn close(import: *Import) void {
     _ = FreeLibrary(import.library);
 }
@@ -77,9 +78,9 @@ const Value = extern union {
     ptr: ?*anyopaque,
 };
 
-// Invoke a foreign function through libffi. Keeping the argument storage here
-// ensures each ffi value pointer refers to an object with the exact size and
-// representation described by its ffi_type.
+// Call a foreign function with libffi. This function holds the storage for the
+// arguments. Therefore each ffi value pointer points to an object that has
+// exactly the size and the form of its `ffi_type`.
 pub fn invoke(import: *const Import, args: [limits.max_args]usize) !u32 {
     var cif: ffi.ffi_cif = undefined;
     var types: [limits.max_args][*c]ffi.ffi_type = undefined;

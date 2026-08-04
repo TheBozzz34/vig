@@ -1,19 +1,21 @@
 const bytecode = @import("vig_bytecode");
 
-// size of the VM's main memory
+// The size of the main memory of the VM.
 pub const memory_size = 4096;
 
-// size of the VM's stack
+// The size of the stack of the VM.
 pub const stack_size = 256;
 
-// size of the VM's data segment, used for load and store ops
+// The size of the data segment of the VM. The `load` and `store` instructions
+// use this segment.
 pub const data_size = 256;
 
-// size of the VM's call stack, used for function calls and returns
+// The size of the call stack of the VM. The `call` and `ret` instructions use
+// this stack.
 pub const call_stack_size = 128;
 
-// The container header and import table are stripped before code is copied into
-// memory, so the largest acceptable file is larger than `memory_size`. The
-// instruction set, the foreign-call limits, and the container layout itself all
-// live in the shared `vig_bytecode` package.
+// The VM removes the container header and the import table before it copies the
+// code into memory. Therefore the largest permitted file is larger than
+// `memory_size`. The shared `vig_bytecode` package holds the instruction set, the
+// foreign-call limits and the container layout.
 pub const max_program_file_size = bytecode.container.maxFileSize(memory_size);

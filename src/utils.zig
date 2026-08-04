@@ -6,10 +6,10 @@ const std = @import("std");
 const Io = std.Io;
 
 pub fn loadProgramFromFile(vm: *machine.VM, io: Io, allocator: std.mem.Allocator, path: []const u8) !void {
-    // The container header and import table are stripped before code enters VM
-    // memory. Allow the largest valid container plus a full memory image, and
-    // read one extra byte so an oversized file remains distinguishable from an
-    // exact fit.
+    // The VM removes the container header and the import table before the code
+    // goes into VM memory. Permit the largest correct container and a full memory
+    // image. Read one more byte. Then a file that is too large is different from
+    // a file of the exact size.
     const program = try std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
@@ -25,7 +25,7 @@ test "file loader permits a full memory image behind a container header" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A memory-sized code region of `halt` instructions.
+    // A code region of `halt` instructions with the size of the VM memory.
     const code: [constants.memory_size]u8 = @splat(@intFromEnum(bytecode.OpCode.halt));
     const layout: bytecode.container.Layout = .{ .code = &code };
 
@@ -54,7 +54,7 @@ test "file loader permits a full memory image behind a container header" {
     try std.testing.expectEqual(constants.memory_size, vm.code_len);
 }
 
-// compare two integers and push the result onto the stack
+// Compare two integers. Put the result on the stack.
 pub fn binaryComparison(
     self: *machine.VM,
     comptime compare: fn (i32, i32) bool,
@@ -67,7 +67,7 @@ pub fn binaryComparison(
     self.sp -= 1;
     self.stack[self.sp - 1] = if (compare(a, b)) 1 else 0;
 }
-// A collection of comparison functions for the VM
+// The comparison functions for the VM.
 pub const comparisons = struct {
     pub fn eq(a: i32, b: i32) bool {
         return a == b;
@@ -94,9 +94,10 @@ pub const comparisons = struct {
     }
 };
 
-// Read a 32-bit unsigned integer operand from the code region at the current
-// instruction pointer. Operands have to lie inside the code, not merely inside
-// the loaded image: static data is not executable.
+// Read an unsigned 32-bit operand from the code region at the instruction
+// pointer. An operand must be inside the code region. It is not sufficient for
+// the operand to be inside the program image, because the static data is not
+// executable.
 pub fn readU32(self: *machine.VM) !u32 {
     if (self.ip > self.code_len or self.code_len - self.ip < 4) {
         return error.SegmentFault;
