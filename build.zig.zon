@@ -32,14 +32,21 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        // The version here is the only other place it appears: everything the
+        // build passes to libffi's config headers is derived from `version` in
+        // build/libffi.zig, which this URL has to agree with.
         .libffi = .{
             .url = "https://github.com/libffi/libffi/releases/download/v3.5.2/libffi-3.5.2.tar.gz",
             .hash = "N-V-__8AAFDiVQA3Q01T64sEaf0mSRyePtaGEqV9gZ37pSti",
         },
+        // Shared with the assembler: opcodes, the container format, and the
+        // verifier.
+        .vig_bytecode = .{ .path = "../vig-bytecode" },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "build",
         "src",
         // For example...
         //"LICENSE",

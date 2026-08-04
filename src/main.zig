@@ -31,7 +31,14 @@ pub fn main(init: std.process.Init) !void {
         const path = args[1];
         std.log.info("Loading program from file: {s}", .{path});
         utils.loadProgramFromFile(&vm, init.io, init.gpa, path) catch |err| {
-            std.log.err("Failed to load program: {s}", .{@errorName(err)});
+            if (vm.verification_failure) |failure| {
+                std.log.err(
+                    "Program rejected by the bytecode verifier at code offset {d}: {s}",
+                    .{ failure.offset, @errorName(failure.reason) },
+                );
+            } else {
+                std.log.err("Failed to load program: {s}", .{@errorName(err)});
+            }
             return err;
         };
     } else {
@@ -39,7 +46,10 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    std.log.info("Loaded {d} program bytes.", .{vm.program_len});
+    std.log.info(
+        "Loaded {d} program bytes: {d} of code, {d} of static data.",
+        .{ vm.program_len, vm.code_len, vm.program_len - vm.code_len },
+    );
     std.log.info("============= VM OUTPUT =============", .{});
 
     vm.run() catch |err| {

@@ -1,8 +1,11 @@
 const std = @import("std");
+const bytecode = @import("vig_bytecode");
 const constants = @import("constants.zig");
 const foreign = @import("foreign.zig");
 const utils = @import("utils.zig");
 
+const container = bytecode.container;
+const verify = bytecode.verify;
 const Io = std.Io;
 
 pub const VM = struct {
@@ -17,16 +20,26 @@ pub const VM = struct {
     call_stack: [constants.call_stack_size]usize,
     csp: usize,
 
-    foreign_imports: [constants.max_foreign_imports]?foreign.Import,
+    foreign_imports: [bytecode.foreign.max_imports]?foreign.Import,
     foreign_import_count: usize,
 
-    // Number of bytes occupied by the currently loaded program. Memory after this point is not executable code.
+    // Bytes of executable instructions at the start of memory. Execution and
+    // every jump target are bounded by this, so static data cannot be executed.
+    code_len: usize = 0,
+
+    // Bytes the whole program image occupies: the code region followed by the
+    // static-data region. Addresses a program pushes are bounded by this, which
+    // is what lets `print_string` and `cstr` arguments reach static data.
     program_len: usize = 0,
 
     // Where `print` and `print_string` send program output. Host diagnostics
     // still go to std.log; this is the guest program's own stdout, so it stays
     // separable from the VM's own chatter and can be captured in tests.
     output: *Io.Writer,
+
+    // Where verification rejected the last program that failed to load. The VM
+    // keeps it instead of logging so the caller can report it in its own voice.
+    verification_failure: ?verify.Failure = null,
 
     // Pointers/Registers
     ip: usize = 0, // Instruction Pointer
@@ -39,7 +52,9 @@ pub const VM = struct {
         @memset(&self.data, 0);
         @memset(&self.call_stack, 0);
 
+        self.code_len = 0;
         self.program_len = 0;
+        self.verification_failure = null;
         self.ip = 0;
         self.sp = 0;
         self.csp = 0;
@@ -60,34 +75,52 @@ pub const VM = struct {
             .csp = 0,
             .foreign_imports = @splat(null),
             .foreign_import_count = 0,
+            .code_len = 0,
             .program_len = 0,
+            .verification_failure = null,
             .output = output,
             .sp = 0,
             .ip = 0,
         };
     }
 
-    // Load a program into the VM's memory, a program is just a sequence of bytes
+    // Load a program into the VM's memory. The file may be a current container,
+    // a version 1 container, or bare code; `container.parse` tells them apart.
     pub fn loadProgram(self: *VM, program: []const u8) !void {
         self.reset();
         errdefer self.clearForeignImports();
 
-        const code = try self.loadForeignImports(program);
-        if (code.len > self.memory.len) return error.ProgramTooLarge;
+        const image = try container.parse(program);
+        if (image.imageLen() > self.memory.len) return error.ProgramTooLarge;
 
-        @memcpy(self.memory[0..code.len], code);
-        self.program_len = code.len;
+        // Only the current format separates code from static data, which is what
+        // the verifier needs in order to walk instructions without decoding
+        // strings. Older programs still run under the per-instruction checks in
+        // `run`.
+        if (image.kind.separatesData()) try self.verifyImage(image);
+
+        try self.loadForeignImports(image);
+
+        @memcpy(self.memory[0..image.code.len], image.code);
+        @memcpy(self.memory[image.code.len..][0..image.data.len], image.data);
+
+        self.code_len = image.code.len;
+        self.program_len = image.imageLen();
+        self.ip = image.header.entry_point;
     }
 
     // loop through instructions in memory, fetch, decode, and execute them
     pub fn run(self: *VM) !void {
-        while (self.ip < self.program_len) {
+        while (self.ip < self.code_len) {
             // Fetch the next instruction
             const raw_op = self.memory[self.ip];
 
             // Decode the instruction into an enum
-            const op = utils.intToEnum(raw_op) catch {
-                std.debug.print("Invalid OpCode: {x}\n", .{raw_op});
+            const op = bytecode.OpCode.fromByte(raw_op) catch {
+                // Written straight to stderr rather than through std.log: a trap
+                // is the program's fault, not a host-level error, and tests that
+                // exercise traps should not read as failing runs.
+                std.debug.print("Invalid OpCode 0x{x:0>2} at code offset {d}\n", .{ raw_op, self.ip });
                 return error.InvalidInstruction;
             };
             self.ip += 1;
@@ -98,7 +131,7 @@ pub const VM = struct {
 
                 .push => {
                     // Fetch next 4 bytes as an i32 operand
-                    if (self.program_len - self.ip < 4) return error.SegmentFault;
+                    if (self.code_len - self.ip < 4) return error.SegmentFault;
                     const value = std.mem.readInt(i32, self.memory[self.ip..][0..4], .little);
                     self.ip += 4;
 
@@ -209,7 +242,7 @@ pub const VM = struct {
                 .jmp => {
                     const target = try utils.readU32(self);
 
-                    if (target >= self.program_len) {
+                    if (target >= self.code_len) {
                         return error.SegmentFault;
                     }
 
@@ -218,7 +251,7 @@ pub const VM = struct {
                 .jmp_zero => {
                     const target = try utils.readU32(self);
 
-                    if (target >= self.program_len) {
+                    if (target >= self.code_len) {
                         return error.SegmentFault;
                     }
 
@@ -236,7 +269,7 @@ pub const VM = struct {
                 .jmp_not_zero => {
                     const target = try utils.readU32(self);
 
-                    if (target >= self.program_len) {
+                    if (target >= self.code_len) {
                         return error.SegmentFault;
                     }
 
@@ -284,7 +317,7 @@ pub const VM = struct {
                 .call => {
                     const target = try utils.readU32(self);
 
-                    if (target >= self.program_len) {
+                    if (target >= self.code_len) {
                         return error.SegmentFault;
                     }
 
@@ -305,7 +338,7 @@ pub const VM = struct {
                     self.ip = self.call_stack[self.csp];
                 },
                 .foreign_call => {
-                    if (self.ip >= self.program_len) return error.SegmentFault;
+                    if (self.ip >= self.code_len) return error.SegmentFault;
                     const import_index = self.memory[self.ip];
                     self.ip += 1;
                     try self.callForeign(import_index);
@@ -353,44 +386,40 @@ pub const VM = struct {
         self.foreign_import_count = 0;
     }
 
-    fn loadForeignImports(self: *VM, program: []const u8) ![]const u8 {
-        const magic = "VIGF";
-        if (program.len < magic.len or !std.mem.eql(u8, program[0..magic.len], magic)) return program;
-        if (program.len < 6) return error.InvalidProgramHeader;
-        if (program[4] != 1) return error.UnsupportedProgramVersion;
+    // Resolve every declaration in the container's import table to a library and
+    // symbol address. The container reader has already bounded the table and the
+    // import count, so this only has to do the resolving.
+    fn loadForeignImports(self: *VM, image: container.Image) !void {
+        std.debug.assert(image.header.import_count <= self.foreign_imports.len);
 
-        const import_count: usize = program[5];
-        if (import_count > constants.max_foreign_imports) return error.TooManyForeignImports;
-
-        var offset: usize = 6;
-        for (0..import_count) |index| {
-            if (program.len -| offset < 3) return error.InvalidProgramHeader;
-            const library_len: usize = program[offset];
-            const symbol_len: usize = program[offset + 1];
-            const arg_count: usize = program[offset + 2];
-            offset += 3;
-
-            if (arg_count > constants.max_foreign_args or program.len -| offset < arg_count) {
-                return error.InvalidProgramHeader;
-            }
-
-            var arg_types: [constants.max_foreign_args]foreign.ArgType = @splat(.u32);
-            for (0..arg_count) |arg_index| {
-                arg_types[arg_index] = try foreign.ArgType.fromByte(program[offset + arg_index]);
-            }
-            offset += arg_count;
-
-            const names_len = library_len + symbol_len;
-            if (program.len -| offset < names_len) return error.InvalidProgramHeader;
-            const library_name = program[offset .. offset + library_len];
-            const symbol_name = program[offset + library_len .. offset + names_len];
-            offset += names_len;
-
-            self.foreign_imports[index] = try foreign.resolve(library_name, symbol_name, arg_types[0..arg_count]);
+        var iterator = image.importIterator();
+        while (try iterator.next()) |import| {
+            self.foreign_imports[self.foreign_import_count] = try foreign.resolve(
+                import.library,
+                import.symbol,
+                import.argTypes(),
+            );
             self.foreign_import_count += 1;
         }
+    }
 
-        return program[offset..];
+    // Prove the code region is safe to execute before any of it runs: see the
+    // vig-bytecode verifier for what that covers.
+    fn verifyImage(self: *VM, image: container.Image) !void {
+        // One mark per code byte. The image has already been checked against the
+        // size of VM memory.
+        var scratch: [constants.memory_size]verify.Mark = undefined;
+
+        var failure: verify.Failure = undefined;
+        verify.verify(.{
+            .code = image.code,
+            .entry_point = image.header.entry_point,
+            .import_count = image.header.import_count,
+            .data_slots = constants.data_size,
+        }, &scratch, &failure) catch |err| {
+            self.verification_failure = failure;
+            return err;
+        };
     }
 
     fn callForeign(self: *VM, import_index: u8) !void {
@@ -400,7 +429,7 @@ pub const VM = struct {
         const arg_count: usize = import.arg_count;
         if (self.sp < arg_count) return error.StackUnderflow;
 
-        var args: [constants.max_foreign_args]usize = @splat(0);
+        var args: [bytecode.foreign.max_args]usize = @splat(0);
         var arg_index = arg_count;
         while (arg_index > 0) {
             arg_index -= 1;
@@ -426,6 +455,8 @@ pub const VM = struct {
         };
     }
 
+    // Guest pointers are offsets into the whole program image, code and static
+    // data alike, so a program can pass a string it declared with `asciiz`.
     fn guestPointer(self: *VM, value: i32, require_terminator: bool) !usize {
         if (value == 0) return 0;
         if (value < 0) return error.InvalidGuestPointer;
@@ -500,7 +531,7 @@ fn expectTrap(program: []const u8, expected_error: anyerror, expected_output: []
     try std.testing.expectEqualStrings(expected_output, harness.written());
 }
 
-fn opByte(code: constants.OpCode) u8 {
+fn opByte(code: bytecode.OpCode) u8 {
     return @intFromEnum(code);
 }
 
@@ -513,10 +544,19 @@ fn push(value: i32) [5]u8 {
 }
 
 // Encode an instruction taking a 4-byte address/target operand.
-fn withAddress(code: constants.OpCode, address: u32) [5]u8 {
+fn withAddress(code: bytecode.OpCode, address: u32) [5]u8 {
     var bytes: [5]u8 = undefined;
     bytes[0] = opByte(code);
     std.mem.writeInt(u32, bytes[1..5], address, .little);
+    return bytes;
+}
+
+// Lay out a current-format container in memory, so the loader is exercised the
+// same way an assembled program exercises it.
+fn buildContainer(layout: container.Layout) ![]u8 {
+    const bytes = try std.testing.allocator.alloc(u8, try container.encodedSize(layout));
+    errdefer std.testing.allocator.free(bytes);
+    std.debug.assert(try container.write(layout, bytes) == bytes.len);
     return bytes;
 }
 
@@ -529,7 +569,7 @@ test "execution stops at the loaded program boundary" {
     const vm = &harness.vm;
 
     const program = [_]u8{
-        @intFromEnum(constants.OpCode.push),
+        @intFromEnum(bytecode.OpCode.push),
         1,
         0,
         0,
@@ -538,12 +578,112 @@ test "execution stops at the loaded program boundary" {
     try vm.loadProgram(&program);
 
     // This would be executed as an invalid instruction if run used the VM's
-    // total memory size instead of program_len.
+    // total memory size instead of code_len.
     vm.memory[program.len] = 0xff;
 
     try vm.run();
+    try std.testing.expectEqual(program.len, vm.code_len);
     try std.testing.expectEqual(program.len, vm.program_len);
     try std.testing.expectEqual(@as(usize, 1), vm.sp);
+}
+
+test "a container starts at its entry point and maps static data after the code" {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    const vm = &harness.vm;
+
+    // A prologue the entry point skips, then the program proper. The string lives
+    // in the static-data region, so its address is the code length.
+    const prologue = push(111) ++ [_]u8{opByte(.halt)};
+    const greeting = 13;
+    const code = prologue ++ push(greeting) ++ [_]u8{ opByte(.print_string), opByte(.halt) };
+    try std.testing.expectEqual(@as(usize, greeting), code.len);
+
+    const program = try buildContainer(.{
+        .code = &code,
+        .data = "hello\x00",
+        .entry_point = prologue.len,
+    });
+    defer std.testing.allocator.free(program);
+
+    try vm.loadProgram(program);
+    try std.testing.expectEqual(@as(usize, prologue.len), vm.ip);
+    try std.testing.expectEqual(@as(usize, code.len), vm.code_len);
+    try std.testing.expectEqual(@as(usize, code.len + 6), vm.program_len);
+
+    try vm.run();
+    try std.testing.expectEqualStrings("hello\n", harness.written());
+    // The prologue never ran, so its value is not on the stack.
+    try std.testing.expectEqual(@as(usize, 1), vm.sp);
+    try std.testing.expectEqual(@as(i32, greeting), vm.stack[0]);
+}
+
+test "static data is never executed, whatever it decodes to" {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    // A byte that is not a valid opcode, immediately after the code region.
+    const program = try buildContainer(.{ .code = &[_]u8{opByte(.halt)}, .data = &[_]u8{0xfe} });
+    defer std.testing.allocator.free(program);
+
+    try harness.vm.loadProgram(program);
+    try harness.vm.run();
+    try std.testing.expectEqual(@as(usize, 1), harness.vm.code_len);
+    try std.testing.expectEqual(@as(usize, 2), harness.vm.program_len);
+}
+
+test "a container is verified before any of it runs" {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    const vm = &harness.vm;
+
+    // `jmp` into the static-data region: a valid file, but not a valid program.
+    const code = withAddress(.jmp, 6) ++ [_]u8{opByte(.halt)};
+    const program = try buildContainer(.{ .code = &code, .data = "x\x00" });
+    defer std.testing.allocator.free(program);
+
+    try std.testing.expectError(error.TargetOutOfRange, vm.loadProgram(program));
+    try std.testing.expectEqual(@as(usize, 0), vm.verification_failure.?.offset);
+    // Nothing was loaded, so nothing can run.
+    try std.testing.expectEqual(@as(usize, 0), vm.code_len);
+    try vm.run();
+    try std.testing.expectEqualStrings("", harness.written());
+}
+
+test "a program larger than VM memory is rejected" {
+    const code: [constants.memory_size]u8 = @splat(opByte(.halt));
+    const program = try buildContainer(.{ .code = &code, .data = "!" });
+    defer std.testing.allocator.free(program);
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    try std.testing.expectError(error.ProgramTooLarge, harness.vm.loadProgram(program));
+}
+
+test "bare code and version 1 containers still load" {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    const vm = &harness.vm;
+
+    // Headerless code, as the first VIG programs were written.
+    try vm.loadProgram(&(push(1) ++ [_]u8{ opByte(.print), opByte(.halt) }));
+    try vm.run();
+    try std.testing.expectEqualStrings("1\n", harness.written());
+
+    // A version 1 container: no code/data split, so the string sits inside the
+    // code region at offset 7 and the program is not verified.
+    const legacy = "VIGF" ++ [_]u8{ 1, 0 } ++
+        push(7) ++ [_]u8{ opByte(.print_string), opByte(.halt) } ++ "again\x00";
+    try vm.loadProgram(legacy);
+    try std.testing.expectEqual(@as(usize, 13), vm.code_len);
+    try std.testing.expectEqual(vm.code_len, vm.program_len);
+    try vm.run();
+    try std.testing.expectEqualStrings("1\nagain\n", harness.written());
 }
 
 test "resolves and invokes a zero-argument Windows API" {
@@ -556,8 +696,8 @@ test "resolves and invokes a zero-argument Windows API" {
 
     const program = "VIGF" ++ [_]u8{ 1, 1, 12, 19, 0 } ++
         "kernel32.dllGetCurrentProcessId" ++ [_]u8{
-            @intFromEnum(constants.OpCode.foreign_call), 0,
-            @intFromEnum(constants.OpCode.halt),
+            @intFromEnum(bytecode.OpCode.foreign_call), 0,
+            @intFromEnum(bytecode.OpCode.halt),
         };
     try vm.loadProgram(program);
     try vm.run();
@@ -573,9 +713,9 @@ test "print_string prints a VIG-managed string and retains its address" {
     const vm = &harness.vm;
 
     const program = [_]u8{
-        @intFromEnum(constants.OpCode.push), 7, 0, 0, 0,
-        @intFromEnum(constants.OpCode.print_string),
-        @intFromEnum(constants.OpCode.halt),
+        @intFromEnum(bytecode.OpCode.push), 7, 0, 0, 0,
+        @intFromEnum(bytecode.OpCode.print_string),
+        @intFromEnum(bytecode.OpCode.halt),
         'h', 'e', 'l', 'l', 'o', 0,
     };
     try vm.loadProgram(&program);
@@ -592,7 +732,7 @@ test "guest strings must be non-null and NUL-terminated within the program" {
     harness.start();
     const vm = &harness.vm;
 
-    const program = [_]u8{ @intFromEnum(constants.OpCode.halt), 'x' };
+    const program = [_]u8{ @intFromEnum(bytecode.OpCode.halt), 'x' };
     try vm.loadProgram(&program);
     try std.testing.expectError(error.InvalidGuestPointer, vm.guestCString(0));
     try std.testing.expectError(error.UnterminatedGuestString, vm.guestCString(1));
@@ -604,7 +744,7 @@ test "print writes program output to the injected writer" {
 
 test "arithmetic operates on the top two values" {
     // Each case leaves one value on the stack and prints it.
-    const cases = [_]struct { code: constants.OpCode, a: i32, b: i32, expected: []const u8 }{
+    const cases = [_]struct { code: bytecode.OpCode, a: i32, b: i32, expected: []const u8 }{
         .{ .code = .add, .a = 7, .b = 5, .expected = "12\n" },
         .{ .code = .sub, .a = 7, .b = 5, .expected = "2\n" },
         .{ .code = .mul, .a = 7, .b = 5, .expected = "35\n" },
@@ -621,7 +761,7 @@ test "arithmetic operates on the top two values" {
 }
 
 test "comparisons push 1 or 0" {
-    const cases = [_]struct { code: constants.OpCode, expected: []const u8 }{
+    const cases = [_]struct { code: bytecode.OpCode, expected: []const u8 }{
         .{ .code = .eq, .expected = "0\n" },
         .{ .code = .ne, .expected = "1\n" },
         .{ .code = .lt, .expected = "1\n" },

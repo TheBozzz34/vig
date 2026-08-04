@@ -1,34 +1,24 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const constants = @import("constants.zig");
+const bytecode = @import("vig_bytecode");
 const ffi = @import("ffi");
 
 // Foreign function interface for VIG. This is a minimal implementation that
 // only supports Windows x64 integer/pointer calls.  This is enough to call
 // simple Windows APIs
 
-pub const ArgType = enum(u8) {
-    i32 = 0,
-    u32 = 1,
-    ptr = 2,
-    cstr = 3,
+// The argument types and the ABI limits are part of the container format, so
+// they come from the shared package rather than being restated here.
+const limits = bytecode.foreign;
+pub const ArgType = limits.ArgType;
 
-    pub fn fromByte(value: u8) !ArgType {
-        return switch (value) {
-            0 => .i32,
-            1 => .u32,
-            2 => .ptr,
-            3 => .cstr,
-            else => error.InvalidForeignType,
-        };
-    }
-};
-
+// A foreign import once its library and symbol have been resolved to addresses.
+// The declaration it was resolved from is `bytecode.foreign.Import`.
 pub const Import = struct {
     library: *anyopaque,
     address: *const anyopaque,
     arg_count: u8,
-    arg_types: [constants.max_foreign_args]ArgType,
+    arg_types: [limits.max_args]ArgType,
 };
 
 // Neccessary Windows API functions for dynamic library loading and symbol resolution
@@ -44,9 +34,9 @@ pub fn resolve(library_name: []const u8, symbol_name: []const u8, arg_types: []c
 
     // Validate input parameters
     if (library_name.len == 0 or symbol_name.len == 0) return error.InvalidForeignImport;
-    if (symbol_name.len > constants.max_foreign_name_len or arg_types.len > constants.max_foreign_args) return error.InvalidForeignImport;
+    if (symbol_name.len > limits.max_name_len or arg_types.len > limits.max_args) return error.InvalidForeignImport;
 
-    if (library_name.len > constants.max_foreign_name_len) return error.InvalidForeignImport;
+    if (library_name.len > limits.max_name_len) return error.InvalidForeignImport;
 
     var library_z: [256:0]u8 = undefined;
     @memcpy(library_z[0..library_name.len], library_name);
@@ -65,7 +55,7 @@ pub fn resolve(library_name: []const u8, symbol_name: []const u8, arg_types: []c
         return error.ForeignSymbolNotFound;
     };
 
-    var types: [constants.max_foreign_args]ArgType = @splat(.u32);
+    var types: [limits.max_args]ArgType = @splat(.u32);
     @memcpy(types[0..arg_types.len], arg_types);
 
     return .{
@@ -90,11 +80,11 @@ const Value = extern union {
 // Invoke a foreign function through libffi. Keeping the argument storage here
 // ensures each ffi value pointer refers to an object with the exact size and
 // representation described by its ffi_type.
-pub fn invoke(import: *const Import, args: [constants.max_foreign_args]usize) !u32 {
+pub fn invoke(import: *const Import, args: [limits.max_args]usize) !u32 {
     var cif: ffi.ffi_cif = undefined;
-    var types: [constants.max_foreign_args][*c]ffi.ffi_type = undefined;
-    var values: [constants.max_foreign_args]Value = undefined;
-    var value_pointers: [constants.max_foreign_args]?*anyopaque = undefined;
+    var types: [limits.max_args][*c]ffi.ffi_type = undefined;
+    var values: [limits.max_args]Value = undefined;
+    var value_pointers: [limits.max_args]?*anyopaque = undefined;
 
     for (0..import.arg_count) |index| {
         switch (import.arg_types[index]) {

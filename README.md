@@ -3,6 +3,32 @@
 VIG is a simple stack based virtual machine written in zig. It has a small set of instructions, and includes a simple assembler.
 Programs can be written in a simplified assembly language, assembled via vigasm, and run directly with vig.exe
 
+The instruction set, the container format, and the bytecode verifier live in
+[vig-bytecode](../vig-bytecode), shared with the
+[assembler](../vig-assembler) so the two cannot disagree about them.
+
+## Loading a program
+
+A program file is a container: a header recording the code length, the
+static-data length, the entry point, the import-table length, and a format
+version and flags, followed by the import table, the code, and the static data.
+The [format is documented in vig-bytecode](../vig-bytecode/README.md#container-format).
+
+The VM copies the code and the static data into memory as one image, with the data
+immediately after the code, then starts at the container's entry point. Only the
+code region is executable: execution stops at its end and every jump and call
+target must fall inside it. Addresses a program pushes may reach the whole image,
+which is how `print_string` and `cstr` foreign arguments reach static data.
+
+Before any of a program runs, it is verified — every reachable instruction must
+decode, every branch must land on an instruction boundary, and control must not
+fall off the end of the code. A rejected program reports the code offset that
+failed and does not execute at all.
+
+Version 1 containers and bare headerless code still load and run, so programs
+assembled before this format existed keep working. They do not separate code from
+static data, so they cannot be verified and rely on the runtime checks alone.
+
 ## Output streams
 
 `print` and `print_string` write to **stdout**. The VM's own diagnostics — the
@@ -16,6 +42,12 @@ vig.exe program.vig > output.txt
 Program output is buffered and flushed when execution ends, including when a
 program traps, so anything printed before a trap is not lost.
 
+## Foreign calls
+
+See [FOREIGN_FUNCTIONS.md](FOREIGN_FUNCTIONS.md). The libffi build lives in
+[build/libffi.zig](build/libffi.zig), which pins the upstream version in one
+place; `build.zig` just calls it.
+
 ## Tests
 
 ```powershell
@@ -24,4 +56,8 @@ zig build test
 
 Each source file with `test` blocks is registered as its own test root in
 `build.zig`, because a Zig test executable only collects tests from its own root
-file.
+file. The shared package has its own suite:
+
+```powershell
+cd ..\vig-bytecode; zig build test
+```

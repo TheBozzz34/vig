@@ -1,48 +1,15 @@
+const bytecode = @import("vig_bytecode");
 const constants = @import("constants.zig");
 const machine = @import("machine.zig");
 const std = @import("std");
 
 const Io = std.Io;
 
-// int to enum conversion for OpCode
-pub fn intToEnum(opcode: u8) !constants.OpCode {
-    return switch (opcode) {
-        0 => constants.OpCode.halt,
-        1 => constants.OpCode.push,
-        2 => constants.OpCode.add,
-        3 => constants.OpCode.sub,
-        4 => constants.OpCode.print,
-        5 => constants.OpCode.dup,
-        6 => constants.OpCode.pop,
-        7 => constants.OpCode.swap,
-        8 => constants.OpCode.mul,
-        9 => constants.OpCode.div,
-        10 => constants.OpCode.mod,
-        11 => constants.OpCode.eq,
-        12 => constants.OpCode.ne,
-        13 => constants.OpCode.lt,
-        14 => constants.OpCode.lte,
-        15 => constants.OpCode.gt,
-        16 => constants.OpCode.gte,
-        17 => constants.OpCode.jmp,
-        18 => constants.OpCode.jmp_zero,
-        19 => constants.OpCode.jmp_not_zero,
-        20 => constants.OpCode.load,
-        21 => constants.OpCode.store,
-        22 => constants.OpCode.call,
-        23 => constants.OpCode.ret,
-        24 => constants.OpCode.foreign_call,
-        25 => constants.OpCode.print_string,
-        26 => constants.OpCode.load_at,
-        27 => constants.OpCode.store_at,
-        else => return error.InvalidInstruction,
-    };
-}
-
 pub fn loadProgramFromFile(vm: *machine.VM, io: Io, allocator: std.mem.Allocator, path: []const u8) !void {
-    // The import header is stripped before code enters VM memory. Allow the
-    // largest valid header plus a full memory image, and read one extra byte so
-    // an oversized container remains distinguishable from an exact fit.
+    // The container header and import table are stripped before code enters VM
+    // memory. Allow the largest valid container plus a full memory image, and
+    // read one extra byte so an oversized file remains distinguishable from an
+    // exact fit.
     const program = try std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
@@ -54,19 +21,20 @@ pub fn loadProgramFromFile(vm: *machine.VM, io: Io, allocator: std.mem.Allocator
     try vm.loadProgram(program);
 }
 
-test "file loader permits a full memory image after a container header" {
+test "file loader permits a full memory image behind a container header" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // A memory-sized code region of `halt` instructions.
+    const code: [constants.memory_size]u8 = @splat(@intFromEnum(bytecode.OpCode.halt));
+    const layout: bytecode.container.Layout = .{ .code = &code };
+
     const program = try std.testing.allocator.alloc(
         u8,
-        constants.foreign_header_prefix_size + constants.memory_size,
+        try bytecode.container.encodedSize(layout),
     );
     defer std.testing.allocator.free(program);
-    @memcpy(program[0..4], "VIGF");
-    program[4] = 1;
-    program[5] = 0;
-    @memset(program[constants.foreign_header_prefix_size..], 0);
+    _ = try bytecode.container.write(layout, program);
 
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "full-size.vig",
@@ -83,6 +51,7 @@ test "file loader permits a full memory image after a container header" {
     defer vm.deinit();
     try loadProgramFromFile(&vm, std.testing.io, std.testing.allocator, path);
     try std.testing.expectEqual(constants.memory_size, vm.program_len);
+    try std.testing.expectEqual(constants.memory_size, vm.code_len);
 }
 
 // compare two integers and push the result onto the stack
@@ -125,9 +94,11 @@ pub const comparisons = struct {
     }
 };
 
-// Read a 32-bit unsigned integer from the VM's memory at the current instruction pointer
+// Read a 32-bit unsigned integer operand from the code region at the current
+// instruction pointer. Operands have to lie inside the code, not merely inside
+// the loaded image: static data is not executable.
 pub fn readU32(self: *machine.VM) !u32 {
-    if (self.ip > self.program_len or self.program_len - self.ip < 4) {
+    if (self.ip > self.code_len or self.code_len - self.ip < 4) {
         return error.SegmentFault;
     }
 
