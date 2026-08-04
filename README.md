@@ -48,6 +48,11 @@ vig.exe program.vig < input.txt
 Before waiting for input, the VM flushes stdout so a prompt printed by the
 program is visible.
 
+`read_byte` reads raw bytes from stdin and pushes `0` through `255`, or `-1` at
+EOF. This permits byte-oriented programs to process streams whose length is not
+known in advance. `print_hex` prints the raw bits of the top stack value as eight
+lowercase hexadecimal digits and retains the value.
+
 ## Foreign calls
 
 See [FOREIGN_FUNCTIONS.md](FOREIGN_FUNCTIONS.md). The libffi build lives in

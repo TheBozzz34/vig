@@ -428,6 +428,22 @@ pub const VM = struct {
                     self.stack[self.sp] = try self.readI32();
                     self.sp += 1;
                 },
+                .read_byte => {
+                    // EOF is data for this instruction rather than a trap, so
+                    // a program can loop until it sees -1.
+                    if (self.sp >= self.stack.len) return error.StackOverflow;
+                    try self.output.flush();
+                    self.stack[self.sp] = self.input.takeByte() catch |err| switch (err) {
+                        error.EndOfStream => -1,
+                        error.ReadFailed => return error.InputReadFailed,
+                    };
+                    self.sp += 1;
+                },
+                .print_hex => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    const bits: u32 = @bitCast(self.stack[self.sp - 1]);
+                    try self.output.print("{x:0>8}\n", .{bits});
+                },
             }
         }
     }
@@ -908,6 +924,23 @@ test "read_i32 distinguishes end, malformed input, and overflow" {
     try expectInputTrap("12x", error.InvalidInput);
     try expectInputTrap("2147483648", error.IntegerOverflow);
     try expectInputTrap("-2147483649", error.IntegerOverflow);
+}
+
+test "read_byte returns raw bytes and uses -1 for end of input" {
+    const read_and_print = [_]u8{ opByte(.read_byte), opByte(.print), opByte(.pop) };
+    const program = read_and_print ++ read_and_print ++ read_and_print ++
+        read_and_print ++ read_and_print ++ [_]u8{opByte(.halt)};
+
+    try expectOutputWithInput(&program, "A\n\xff", "65\n10\n255\n-1\n-1\n");
+}
+
+test "print_hex prints all 32 bits and retains the value" {
+    const program =
+        push(0) ++ [_]u8{ opByte(.print_hex), opByte(.pop) } ++
+        push(0x1234abcd) ++ [_]u8{ opByte(.print_hex), opByte(.pop) } ++
+        push(-1) ++ [_]u8{ opByte(.print_hex), opByte(.print), opByte(.halt) };
+
+    try expectOutput(&program, "00000000\n1234abcd\nffffffff\n-1\n");
 }
 
 test "arithmetic operates on the top two values" {
