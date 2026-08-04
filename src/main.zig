@@ -44,6 +44,14 @@ pub fn main(init: std.process.Init) !void {
                     "Program rejected by the bytecode verifier at code offset {d}: {s}",
                     .{ failure.offset, @errorName(failure.reason) },
                 );
+            } else if (err == error.ForeignCallsUnsupported) {
+                // The program is correct; this build of VIG cannot run it. Say
+                // which of the two it is, because the error name on its own reads
+                // like a fault in the program.
+                std.log.err(
+                    "This program declares a foreign import, and VIG supports foreign calls on Windows only.",
+                    .{},
+                );
             } else {
                 std.log.err("Failed to load program: {s}", .{@errorName(err)});
             }

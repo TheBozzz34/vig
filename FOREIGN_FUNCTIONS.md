@@ -10,6 +10,24 @@ encoding are defined in [vig-bytecode](../vig-bytecode).
 A `foreign_call` whose index does not name a declared import is rejected when the
 program is verified, before it runs.
 
+## Platform support
+
+Foreign calls need three things from the operating system: a way to load a
+library, a way to find a symbol inside it, and the calling convention of the
+target. Only Windows supplies all three at this time, so `src/foreign.zig`
+selects its implementation at compile time and every other system gets one that
+refuses each declaration with `error.ForeignCallsUnsupported`.
+
+The rest of the VM needs none of those three, so **the VM itself builds and runs
+on Linux and macOS as well as Windows**. A program that declares no `extern`
+behaves identically on all of them. Only a program with an `extern` is refused,
+and it is refused when it loads rather than part-way through a run.
+
+A port supplies the three missing pieces: `dlopen` and `dlsym` in place of
+`LoadLibraryA` and `GetProcAddress`, and the `FFI_UNIX64` calling convention in
+place of `FFI_WIN64`. libffi is already built for those targets, so the work is
+contained to the one namespace in `src/foreign.zig`.
+
 The VM builds the pinned official libffi source release from `build.zig.zon` and
 generates Zig bindings from its C header; no system libffi installation or
 `pkg-config` setup is needed. That build lives in
@@ -20,7 +38,7 @@ The current foreign-call ABI is intentionally small:
 
 - At most four `i32`, `u32`, `ptr`, or `cstr` arguments.
 - A 32-bit integer result, pushed on the VIG stack.
-- Windows x64 integer/pointer calls only.
+- Windows x64 integer/pointer calls only. See Platform support above.
 
 `ptr` and `cstr` values are offsets into the loaded VIG program image — the code
 region followed by the static-data region — not native addresses. A zero pointer

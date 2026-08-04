@@ -53,6 +53,18 @@ EOF. This permits byte-oriented programs to process streams whose length is not
 known in advance. `print_hex` prints the raw bits of the top stack value as eight
 lowercase hexadecimal digits and retains the value.
 
+## Supported systems
+
+The VM builds and runs on Windows, Linux and macOS. Every instruction behaves the
+same on all of them.
+
+Foreign calls are the one exception: they need a way to load a library, a way to
+find a symbol in it, and the calling convention of the target, and only Windows
+supplies all three at this time. `src/foreign.zig` chooses its implementation at
+compile time. On another system a program that declares an `extern` is refused when
+it loads, with a message that says so; a program that declares none is unaffected.
+[FOREIGN_FUNCTIONS.md](FOREIGN_FUNCTIONS.md) describes what a port needs.
+
 ## Foreign calls
 
 See [FOREIGN_FUNCTIONS.md](FOREIGN_FUNCTIONS.md). The libffi build lives in

@@ -2,11 +2,15 @@
 # path dependencies, so this workflow checks out the three repositories side by
 # side in the layout that a developer has locally.
 #
-# The job runs on Windows only. `src/foreign.zig` declares `LoadLibraryA`,
-# `GetProcAddress` and `FreeLibrary` as `extern "kernel32"` with no condition on
-# the target, and `clearForeignImports` reaches them from `deinit`. Therefore the
-# VM does not link for any other operating system at this time, even though
-# vig-bytecode and vig-assembler both cross-compile without a change.
+# The suite runs on Linux as well as Windows. `src/foreign.zig` chooses its
+# implementation at compile time, so a system with no foreign-call support builds
+# and runs everything except a program that declares an `extern`. The one test
+# that calls a Windows API skips itself elsewhere, and the four example programs
+# that need a Windows library are not in the corpus.
+#
+# Linux is the job that matters for a regression: a `kernel32` declaration that
+# leaks back into a path any code can reach breaks that job and not the Windows
+# one.
 name: test
 
 on:
@@ -17,7 +21,11 @@ on:
 
 jobs:
   test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,3 +55,21 @@ jobs:
       # assembler fails here, which `zig build test` on its own does not.
       - run: zig build test-all --summary all
         working-directory: vig
+
+      # A build for each system that VIG supports, from one job. This catches a
+      # declaration that belongs to a single system before a user of another
+      # system meets it, and it covers macOS, for which there is no job above.
+      #
+      # `aarch64-macos` is not here. It needs `FFI_EXEC_TRAMPOLINE_TABLE`, and the
+      # `fficonfig.h` that `build/libffi.zig` writes does not agree with that mode,
+      # so libffi itself does not compile. That is a libffi configuration to fix on
+      # its own, and it is not about the VM.
+      - name: Cross-compile for every supported system
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: vig
+        run: |
+          zig build -Dtarget=x86_64-linux
+          zig build -Dtarget=aarch64-linux
+          zig build -Dtarget=x86_64-linux-musl
+          zig build -Dtarget=x86_64-macos
+          zig build -Dtarget=x86_64-windows
