@@ -409,8 +409,8 @@ pub const VM = struct {
         }
 
         if (self.sp >= self.stack.len) return error.StackOverflow;
-        const result = foreign.invoke(import, args);
-        self.stack[self.sp] = @bitCast(@as(u32, @truncate(result)));
+        const result = try foreign.invoke(import, args);
+        self.stack[self.sp] = @bitCast(result);
         self.sp += 1;
     }
 

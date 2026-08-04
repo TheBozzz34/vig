@@ -3,7 +3,11 @@
 VIG can call a small subset of Windows x64 APIs declared by a VIGasm `extern`
 statement. The assembler stores those declarations in a `VIGF` program header;
 the VM resolves each DLL symbol with `LoadLibraryA` and `GetProcAddress` when it
-loads the program.
+loads the program, then uses libffi to prepare and perform each call.
+
+The VM builds the pinned official libffi source release in `build.zig.zon` and
+generates Zig bindings from its C header; no system libffi installation or
+`pkg-config` setup is needed.
 
 The current foreign-call ABI is intentionally small:
 

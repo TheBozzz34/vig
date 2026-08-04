@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const constants = @import("constants.zig");
+const ffi = @import("ffi");
 
 // Foreign function interface for VIG. This is a minimal implementation that
 // only supports Windows x64 integer/pointer calls.  This is enough to call
@@ -80,16 +81,56 @@ pub fn close(import: *Import) void {
     _ = FreeLibrary(import.library);
 }
 
-// invoke a forign function
-pub fn invoke(import: *const Import, args: [constants.max_foreign_args]usize) usize {
-    // VIG foreign calls are Windows x64 integer/pointer calls only. All of
-    // these argument types occupy one ABI word, so arity is sufficient here.
-    return switch (import.arg_count) {
-        0 => @as(*const fn () callconv(.winapi) usize, @ptrCast(import.address))(),
-        1 => @as(*const fn (usize) callconv(.winapi) usize, @ptrCast(import.address))(args[0]),
-        2 => @as(*const fn (usize, usize) callconv(.winapi) usize, @ptrCast(import.address))(args[0], args[1]),
-        3 => @as(*const fn (usize, usize, usize) callconv(.winapi) usize, @ptrCast(import.address))(args[0], args[1], args[2]),
-        4 => @as(*const fn (usize, usize, usize, usize) callconv(.winapi) usize, @ptrCast(import.address))(args[0], args[1], args[2], args[3]),
-        else => unreachable,
-    };
+const Value = extern union {
+    i32: i32,
+    u32: u32,
+    ptr: ?*anyopaque,
+};
+
+// Invoke a foreign function through libffi. Keeping the argument storage here
+// ensures each ffi value pointer refers to an object with the exact size and
+// representation described by its ffi_type.
+pub fn invoke(import: *const Import, args: [constants.max_foreign_args]usize) !u32 {
+    var cif: ffi.ffi_cif = undefined;
+    var types: [constants.max_foreign_args][*c]ffi.ffi_type = undefined;
+    var values: [constants.max_foreign_args]Value = undefined;
+    var value_pointers: [constants.max_foreign_args]?*anyopaque = undefined;
+
+    for (0..import.arg_count) |index| {
+        switch (import.arg_types[index]) {
+            .i32 => {
+                types[index] = &ffi.ffi_type_sint32;
+                values[index].i32 = @bitCast(@as(u32, @truncate(args[index])));
+                value_pointers[index] = &values[index].i32;
+            },
+            .u32 => {
+                types[index] = &ffi.ffi_type_uint32;
+                values[index].u32 = @truncate(args[index]);
+                value_pointers[index] = &values[index].u32;
+            },
+            .ptr, .cstr => {
+                types[index] = &ffi.ffi_type_pointer;
+                values[index].ptr = if (args[index] == 0) null else @ptrFromInt(args[index]);
+                value_pointers[index] = @ptrCast(&values[index].ptr);
+            },
+        }
+    }
+
+    const status = ffi.ffi_prep_cif(
+        &cif,
+        ffi.FFI_WIN64,
+        import.arg_count,
+        &ffi.ffi_type_uint32,
+        &types,
+    );
+    if (status != ffi.FFI_OK) return error.ForeignCallPreparationFailed;
+
+    var result: u32 = 0;
+    ffi.ffi_call(
+        &cif,
+        @ptrCast(import.address),
+        &result,
+        &value_pointers,
+    );
+    return result;
 }
