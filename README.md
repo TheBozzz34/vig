@@ -11,7 +11,7 @@ The instruction set, container format, and the bytecode verifier live in
 A program file a has this structure: a header recording the code length, the
 static-data length, the entry point, the import-table length, and a format
 version and flags, followed by the import table, the code, and the static data.
-The [format is documented in vig-bytecode](https://github.com/TheBozzz34/vig-bytecode/README.md#container-format).
+The [format is documented in vig-bytecode](https://github.com/TheBozzz34/vig-bytecode#container-formatt).
 
 The VM copies the code and the static data into memory as one image, with the data
 immediately after the code, then starts at the container's entry point. Only the
