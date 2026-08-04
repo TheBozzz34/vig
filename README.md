@@ -58,12 +58,18 @@ lowercase hexadecimal digits and retains the value.
 The VM builds and runs on Windows, Linux and macOS. Every instruction behaves the
 same on all of them.
 
-Foreign calls are the one exception: they need a way to load a library, a way to
-find a symbol in it, and the calling convention of the target, and only Windows
-supplies all three at this time. `src/foreign.zig` chooses its implementation at
-compile time. On another system a program that declares an `extern` is refused when
-it loads, with a message that says so; a program that declares none is unaffected.
-[FOREIGN_FUNCTIONS.md](FOREIGN_FUNCTIONS.md) describes what a port needs.
+Foreign calls work on Windows and on a system with the POSIX loader.
+`src/foreign.zig` chooses its implementation at compile time: `LoadLibraryA` and
+`GetProcAddress` on Windows, `dlopen` and `dlsym` elsewhere, and libffi supplies
+the calling convention of the target for both. A system that has neither loader
+refuses a program that declares an `extern` when it loads, with a message that says
+so; a program that declares none is unaffected.
+
+A library *name* is still particular to the system, because the name in the
+program goes to the loader as it stands. A program that names `kernel32.dll` runs
+on Windows only, and one that names `libc.so.6` runs on Linux only, even though
+both systems can make the call.
+[FOREIGN_FUNCTIONS.md](FOREIGN_FUNCTIONS.md) has the details.
 
 ## Foreign calls
 

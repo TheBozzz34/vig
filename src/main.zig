@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const machine = @import("machine.zig");
 const utils = @import("utils.zig");
@@ -48,11 +49,17 @@ pub fn main(init: std.process.Init) !void {
                 // The program is correct; this build of VIG cannot run it. Say
                 // which of the two it is, because the error name on its own reads
                 // like a fault in the program.
-
-                //TODO: VIG should now support foreign calls on Linux and macOS. Might need to remove this
                 std.log.err(
-                    "This program declares a foreign import, and VIG supports foreign calls on Windows only.",
+                    "This program declares a foreign import, and this system has no library loader that VIG can use.",
                     .{},
+                );
+            } else if (err == error.ForeignLibraryNotFound) {
+                // The system has a loader and the loader refused the name. The
+                // usual reason is a program written for a different system, because
+                // the name goes to the loader as the program wrote it.
+                std.log.err(
+                    "This program declares a foreign import that {s} cannot load. A library name is particular to one system.",
+                    .{@tagName(builtin.os.tag)},
                 );
             } else {
                 std.log.err("Failed to load program: {s}", .{@errorName(err)});

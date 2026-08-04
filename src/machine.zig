@@ -1212,6 +1212,36 @@ test "resolves and invokes a zero-argument Windows API" {
     try std.testing.expect(vm.stack[0] > 0);
 }
 
+test "resolves and invokes a zero-argument C library function" {
+    // The twin of the test above for a system with the POSIX loader. It proves that
+    // `foreign_call` reaches a real function through `dlopen` and `dlsym`, and not
+    // only that `src/foreign.zig` compiles for such a system. The name of the C
+    // library is particular to the system, so the test skips a system whose name it
+    // does not know and a build that can load nothing.
+    const library = switch (@import("builtin").os.tag) {
+        .linux => if (@import("builtin").abi.isGnu()) "libc.so.6" else return error.SkipZigTest,
+        .macos => "libSystem.B.dylib",
+        else => return error.SkipZigTest,
+    };
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    const vm = harness.vm;
+
+    const program = try buildContainer(.{
+        .imports = &.{.{ .library = library, .symbol = "getpid" }},
+        .code = &[_]u8{ opByte(.foreign_call), 0, opByte(.halt) },
+    });
+    defer std.testing.allocator.free(program);
+
+    try vm.loadProgram(program);
+    try vm.run();
+
+    try std.testing.expectEqual(@as(usize, 1), vm.sp);
+    try std.testing.expect(vm.stack[0] > 0);
+}
+
 test "print_string prints a VIG-managed string and retains its address" {
     var harness = Harness.init();
     defer harness.deinit();

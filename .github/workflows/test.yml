@@ -2,11 +2,11 @@
 # path dependencies, so this workflow checks out the three repositories side by
 # side in the layout that a developer has locally.
 #
-# The suite runs on Linux as well as Windows. `src/foreign.zig` chooses its
-# implementation at compile time, so a system with no foreign-call support builds
-# and runs everything except a program that declares an `extern`. The one test
-# that calls a Windows API skips itself elsewhere, and the four example programs
-# that need a Windows library are not in the corpus.
+# The suite runs on Linux as well as Windows. `src/foreign.zig` chooses its loader
+# at compile time, and each job covers a different one: `LoadLibraryA` on Windows
+# and `dlopen` on Linux. The two tests that name a library name themselves a
+# library of the system that runs them and skip on the other, and the four example
+# programs that need a Windows library are not in the corpus.
 #
 # Linux is the job that matters for a regression: a `kernel32` declaration that
 # leaks back into a path any code can reach breaks that job and not the Windows

@@ -1,11 +1,10 @@
 # Foreign functions
 
-VIG can call a small subset of Windows x64 APIs declared by a VIGasm `extern`
-statement. The assembler stores those declarations in the import table of the
-`VIGF` container; the VM resolves each DLL symbol with `LoadLibraryA` and
-`GetProcAddress` when it loads the program, then uses libffi to prepare and
-perform each call. The argument types, the limits below, and the import-table
-encoding are defined in [vig-bytecode](../vig-bytecode).
+VIG can call a small subset of the native library functions declared by a VIGasm
+`extern` statement. The assembler stores those declarations in the import table of
+the `VIGF` container; the VM resolves each symbol when it loads the program, then
+uses libffi to prepare and perform each call. The argument types, the limits below,
+and the import-table encoding are defined in [vig-bytecode](../vig-bytecode).
 
 A `foreign_call` whose index does not name a declared import is rejected when the
 program is verified, before it runs.
@@ -14,19 +13,44 @@ program is verified, before it runs.
 
 Foreign calls need three things from the operating system: a way to load a
 library, a way to find a symbol inside it, and the calling convention of the
-target. Only Windows supplies all three at this time, so `src/foreign.zig`
-selects its implementation at compile time and every other system gets one that
-refuses each declaration with `error.ForeignCallsUnsupported`.
+target. `src/foreign.zig` selects one namespace at compile time:
 
-The rest of the VM needs none of those three, so **the VM itself builds and runs
-on Linux and macOS as well as Windows**. A program that declares no `extern`
-behaves identically on all of them. Only a program with an `extern` is refused,
-and it is refused when it loads rather than part-way through a run.
+| System | Load | Find symbol | Convention |
+| --- | --- | --- | --- |
+| Windows | `LoadLibraryA` | `GetProcAddress` | `FFI_WIN64` |
+| Linux, macOS, FreeBSD, NetBSD, OpenBSD, DragonFly, illumos | `dlopen` | `dlsym` | `FFI_DEFAULT_ABI` for the target |
+| any other | — | — | — |
 
-A port supplies the three missing pieces: `dlopen` and `dlsym` in place of
-`LoadLibraryA` and `GetProcAddress`, and the `FFI_UNIX64` calling convention in
-place of `FFI_WIN64`. libffi is already built for those targets, so the work is
-contained to the one namespace in `src/foreign.zig`.
+`FFI_DEFAULT_ABI` is what libffi defines in the `ffitarget.h` of the
+architecture: `FFI_UNIX64` for x86-64, `FFI_SYSV` for AArch64 and 32-bit ARM.
+Therefore a new architecture needs no change in the VM. `foreign.supported` says
+whether the running build has a loader, and a system that has none refuses each
+declaration with `error.ForeignCallsUnsupported`.
+
+The POSIX namespace opens a library with `RTLD_NOW` and without `RTLD_GLOBAL`:
+a library whose own symbols are incomplete then fails at load time rather than
+part-way through a call, and an import does not change what a later load in the
+same process can see.
+
+The rest of the VM needs none of those three things, so **the VM itself builds and
+runs on every one of those systems**, and a program that declares no `extern`
+behaves identically on all of them.
+
+### A library name is not portable
+
+The name in the `extern` declaration goes to the loader of the running system as
+it stands. The VM makes no name from a shorter one, because the answer differs
+per system — `libc.so.6` against `libSystem.B.dylib`, with a version suffix that
+only the author of the program knows.
+
+So a program that names `kernel32.dll` still fails on Linux. It fails with
+`error.ForeignLibraryNotFound` rather than `error.ForeignCallsUnsupported`, and it
+fails when the program loads rather than part-way through a run. Making one
+program that calls into whichever system runs it is a job for the assembler or for
+the program, not for the loader here.
+
+A static build is a second limit: a statically linked musl executable has no
+dynamic loader, so `dlopen` finds nothing even though the build reports support.
 
 The VM builds the pinned official libffi source release from `build.zig.zon` and
 generates Zig bindings from its C header; no system libffi installation or
@@ -38,7 +62,8 @@ The current foreign-call ABI is intentionally small:
 
 - At most four `i32`, `u32`, `ptr`, or `cstr` arguments.
 - A 32-bit integer result, pushed on the VIG stack.
-- Windows x64 integer/pointer calls only. See Platform support above.
+- Integer and pointer calls only, in the default convention of the target. See
+  Platform support above.
 
 `ptr` and `cstr` values are offsets into the loaded VIG program image — the code
 region followed by the static-data region — not native addresses. A zero pointer
