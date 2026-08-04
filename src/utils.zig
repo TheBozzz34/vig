@@ -40,12 +40,49 @@ pub fn intToEnum(opcode: u8) !constants.OpCode {
 }
 
 pub fn loadProgramFromFile(vm: *machine.VM, io: Io, allocator: std.mem.Allocator, path: []const u8) !void {
-    // Read one byte beyond VM capacity so loadProgram can distinguish an
-    // over-sized file from one that exactly fills VM memory.
-    const program = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(vm.memory.len + 1));
+    // The import header is stripped before code enters VM memory. Allow the
+    // largest valid header plus a full memory image, and read one extra byte so
+    // an oversized container remains distinguishable from an exact fit.
+    const program = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(constants.max_program_file_size + 1),
+    );
     defer allocator.free(program);
 
     try vm.loadProgram(program);
+}
+
+test "file loader permits a full memory image after a container header" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const program = try std.testing.allocator.alloc(
+        u8,
+        constants.foreign_header_prefix_size + constants.memory_size,
+    );
+    defer std.testing.allocator.free(program);
+    @memcpy(program[0..4], "VIGF");
+    program[4] = 1;
+    program[5] = 0;
+    @memset(program[constants.foreign_header_prefix_size..], 0);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "full-size.vig",
+        .data = program,
+    });
+    const path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/full-size.vig",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(path);
+
+    var vm = machine.VM.init(undefined);
+    defer vm.deinit();
+    try loadProgramFromFile(&vm, std.testing.io, std.testing.allocator, path);
+    try std.testing.expectEqual(constants.memory_size, vm.program_len);
 }
 
 // compare two integers and push the result onto the stack

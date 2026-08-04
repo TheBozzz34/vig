@@ -15,6 +15,14 @@ pub const call_stack_size = 128;
 // host pointers or callback support to VIG programs.
 pub const max_foreign_imports = 16;
 pub const max_foreign_args = 4;
+pub const max_foreign_name_len = 255;
+
+// The on-disk container header is removed before code is copied into memory,
+// so its maximum size is tracked separately from `memory_size`.
+pub const foreign_header_prefix_size = 6; // magic, version, import count
+pub const max_foreign_header_size = foreign_header_prefix_size + max_foreign_imports *
+    (3 + max_foreign_args + 2 * max_foreign_name_len);
+pub const max_program_file_size = memory_size + max_foreign_header_size;
 
 // All opcodes
 pub const OpCode = enum(u8) {

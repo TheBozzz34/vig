@@ -44,9 +44,9 @@ pub fn resolve(library_name: []const u8, symbol_name: []const u8, arg_types: []c
 
     // Validate input parameters
     if (library_name.len == 0 or symbol_name.len == 0) return error.InvalidForeignImport;
-    if (symbol_name.len > 255 or arg_types.len > constants.max_foreign_args) return error.InvalidForeignImport;
+    if (symbol_name.len > constants.max_foreign_name_len or arg_types.len > constants.max_foreign_args) return error.InvalidForeignImport;
 
-    if (library_name.len > 255) return error.InvalidForeignImport;
+    if (library_name.len > constants.max_foreign_name_len) return error.InvalidForeignImport;
 
     var library_z: [256:0]u8 = undefined;
     @memcpy(library_z[0..library_name.len], library_name);
