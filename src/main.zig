@@ -48,6 +48,8 @@ pub fn main(init: std.process.Init) !void {
                 // The program is correct; this build of VIG cannot run it. Say
                 // which of the two it is, because the error name on its own reads
                 // like a fault in the program.
+
+                //TODO: VIG should now support foreign calls on Linux and macOS. Might need to remove this
                 std.log.err(
                     "This program declares a foreign import, and VIG supports foreign calls on Windows only.",
                     .{},

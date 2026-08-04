@@ -1,15 +1,7 @@
 //! Tests that use the assembler and the VM together.
 //!
 //! Each test in `machine.zig` writes its program as instruction bytes, and each
-//! test in the assembler stops at the bytes of the container. Neither kind of
-//! test can see a disagreement between the two tools: what the assembler writes
-//! for a line of source, and what the VM then does with those bytes. The address
-//! of a label, the operand of `store` and the value that `store_at` takes from
-//! the stack must all mean the same thing in the assembler and in the VM.
-//!
-//! Therefore each test here starts at source text. It assembles that text, loads
-//! the container into the VM, runs it and compares what the program printed. A
-//! change that moves an address in one tool only makes a test here fail.
+//! test in the assembler stops at the bytes of the container.
 
 const std = @import("std");
 const assembler = @import("vig_assembler");

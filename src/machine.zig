@@ -12,10 +12,7 @@ const Io = std.Io;
 ///
 /// This structure holds the guest memory, the stacks and the verifier scratch
 /// inline, so it is far larger than a machine register and it grows with
-/// `constants.memory_size`. Therefore a caller keeps a VM behind a pointer and
-/// initialises it in place with `init`. A VM that a function returns by value, or
-/// that a `var` on the stack of a function holds, puts the whole of that memory on
-/// the call stack, and a larger `memory_size` then overruns it.
+/// `constants.memory_size`.
 pub const VM = struct {
     // The memory and the stack: an array of bytes and an array of integers.
     memory: [constants.memory_size]u8,
@@ -32,20 +29,16 @@ pub const VM = struct {
     foreign_import_count: usize,
 
     // The number of bytes of executable instructions at the start of the memory.
-    // Execution and each jump target must stay inside this length. Therefore the
-    // VM cannot execute the static data.
+    // Execution and each jump target must stay inside this length.
     code_len: usize = 0,
 
     // The number of bytes in the complete program image: the code region, then
     // the static-data region. An address from the program must stay inside this
-    // length. Therefore `print_string` and a `cstr` argument can use the static
-    // data.
+    // length.
     program_len: usize = 0,
 
     // The destination for the output of `print` and `print_string`. This writer
-    // is the stdout of the guest program. The diagnostic messages of the host go
-    // to `std.log`. Therefore the two are apart, and a test can collect the
-    // output of the program.
+    // is the stdout of the guest program.
     output: *Io.Writer,
 
     // The source for `read_i32`. Like output, this is injected so a caller can
@@ -53,8 +46,7 @@ pub const VM = struct {
     input: *Io.Reader,
 
     // The location at which the verifier refused the last program. The VM holds
-    // this value and writes no message. Therefore the caller can write its own
-    // message.
+    // this value and writes no message.
     verification_failure: ?verify.Failure = null,
 
     // The registers.
@@ -93,12 +85,6 @@ pub const VM = struct {
 
     // Give a VM its default values, in the storage that the caller supplies. The
     // streams must stay in existence longer than the VM. `reset` does not change
-    // them.
-    //
-    // The caller owns the storage: an arena in `main`, the testing allocator in a
-    // test. This function writes into that storage and gives back no VM, so the
-    // memory of the VM never travels through a return value or through the stack of
-    // a function.
     pub fn init(self: *VM, input: *Io.Reader, output: *Io.Writer) void {
         self.* = .{
             .memory = @splat(0),
@@ -540,11 +526,6 @@ pub const VM = struct {
     // The program image is an array of bytes, and a guest pointer indexes it by
     // byte. One number therefore means two different places, and a program cannot
     // use it for both.
-    //
-    // The move to one byte-addressed guest memory changes the bodies here: a slot
-    // index becomes a byte offset, and an access gains a width. It does not change
-    // `run`, and it does not change how the two forms of an address relate to each
-    // other, because both already arrive through one check.
 
     // Check a data-segment address from the stack. A negative value has no
     // unsigned equivalent. Therefore a negative value gives a fault. It does not
@@ -580,11 +561,6 @@ pub const VM = struct {
     // the globals, the frames and a heap move into one memory, this limit grows to
     // take in those regions, and `guestPointer` and `guestCString` both follow it.
     //
-    // It stays at the image for now. A wider limit would let a `cstr` argument and
-    // `print_string` reach the space above the image, but memory there starts as
-    // zeros, so every address would look like the end of a string and
-    // `UnterminatedGuestString` would stop meaning anything. That trade belongs
-    // with the move of the static data into this memory.
     fn guestPointerLimit(self: *const VM) usize {
         return self.program_len;
     }

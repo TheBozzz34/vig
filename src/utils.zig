@@ -98,9 +98,7 @@ pub const comparisons = struct {
 };
 
 // Read an unsigned 32-bit operand from the code region at the instruction
-// pointer. An operand must be inside the code region. It is not sufficient for
-// the operand to be inside the program image, because the static data is not
-// executable.
+// pointer. An operand must be inside the code region.
 pub fn readU32(self: *machine.VM) !u32 {
     if (self.ip > self.code_len or self.code_len - self.ip < 4) {
         return error.SegmentFault;

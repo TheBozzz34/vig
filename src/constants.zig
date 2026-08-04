@@ -14,10 +14,9 @@ const bytecode = @import("vig_bytecode");
 // `code_len` and `program_len` are on the VM, because they belong to the program
 // that is loaded and not to the build.
 //
-// The cost of this value is paid twice: once for the memory and once for the
+// Value is used once for the memory and once for the
 // verifier scratch, which needs one mark for each byte of the code region. At
 // 64 KiB that is 128 KiB for a VM, which is why the VM lives behind a pointer.
-// A run with this at 1 MiB also passes, so the value is a choice and not a limit.
 pub const memory_size = 65536;
 
 // The size of the stack of the VM.
