@@ -444,6 +444,12 @@ pub const VM = struct {
                     const bits: u32 = @bitCast(self.stack[self.sp - 1]);
                     try self.output.print("{x:0>8}\n", .{bits});
                 },
+                .write_byte => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    const byte: u8 = @truncate(@as(u32, @bitCast(self.stack[self.sp - 1])));
+                    try self.output.writeAll(&[_]u8{byte});
+                    self.sp -= 1;
+                },
             }
         }
     }
@@ -858,9 +864,9 @@ test "resolves and invokes a zero-argument Windows API" {
 
     const program = "VIGF" ++ [_]u8{ 1, 1, 12, 19, 0 } ++
         "kernel32.dllGetCurrentProcessId" ++ [_]u8{
-            @intFromEnum(bytecode.OpCode.foreign_call), 0,
-            @intFromEnum(bytecode.OpCode.halt),
-        };
+        @intFromEnum(bytecode.OpCode.foreign_call), 0,
+        @intFromEnum(bytecode.OpCode.halt),
+    };
     try vm.loadProgram(program);
     try vm.run();
 
@@ -875,10 +881,9 @@ test "print_string prints a VIG-managed string and retains its address" {
     const vm = &harness.vm;
 
     const program = [_]u8{
-        @intFromEnum(bytecode.OpCode.push), 7, 0, 0, 0,
-        @intFromEnum(bytecode.OpCode.print_string),
-        @intFromEnum(bytecode.OpCode.halt),
-        'h', 'e', 'l', 'l', 'o', 0,
+        @intFromEnum(bytecode.OpCode.push),         7,                                  0,   0,   0,
+        @intFromEnum(bytecode.OpCode.print_string), @intFromEnum(bytecode.OpCode.halt), 'h', 'e', 'l',
+        'l',                                        'o',                                0,
     };
     try vm.loadProgram(&program);
     try vm.run();

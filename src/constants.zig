@@ -8,7 +8,7 @@ pub const stack_size = 256;
 
 // The size of the data segment of the VM. The `load` and `store` instructions
 // use this segment.
-pub const data_size = 256;
+pub const data_size = 4096;
 
 // The size of the call stack of the VM. The `call` and `ret` instructions use
 // this stack.
