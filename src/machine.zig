@@ -572,6 +572,11 @@ pub const VM = struct {
         }
 
         if (self.sp >= self.stack.len) return error.StackOverflow;
+
+        // Flush before before the foreign call
+
+        try self.output.flush();
+
         const result = try foreign.invoke(import, args);
         self.stack[self.sp] = @bitCast(result);
         self.sp += 1;
