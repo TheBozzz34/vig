@@ -1467,6 +1467,283 @@ test "the data segment is bounded at run time and not only by the verifier" {
     try std.testing.expectError(error.DataAddressOutOfRange, harness.vm.loadProgram(image));
 }
 
+// Byte-addressed access ------------------------------------------------------
+
+// A container whose code is `code` and whose static data is `data`, loaded and run.
+// A byte-addressed test needs a real image, because the boundary between the code
+// and the data is what decides which addresses a store may use.
+fn runImage(harness: *Harness, code: []const u8, data: []const u8) !void {
+    const image = try buildContainer(.{ .code = code, .data = data });
+    defer std.testing.allocator.free(image);
+
+    try harness.vm.loadProgram(image);
+    try harness.vm.run();
+}
+
+// The address of the static data is the length of the code, and a test must put
+// that address inside the code that it measures. `push` is five bytes whatever
+// value it carries, so the same instructions with a zero address have the same
+// length as the real ones. Therefore this function gives the data address of a
+// program without a count of its bytes by hand, and a change to the program cannot
+// leave a stale number behind.
+fn dataBase(shape: []const u8) i32 {
+    return @intCast(shape.len);
+}
+
+test "a narrow load extends the sign only in its signed form" {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    const shape = push(0) ++ [_]u8{ opByte(.load8_u), opByte(.print), opByte(.pop) } ++
+        push(0) ++ [_]u8{ opByte(.load8_s), opByte(.print), opByte(.pop) } ++
+        push(0) ++ [_]u8{ opByte(.load16_u), opByte(.print), opByte(.pop) } ++
+        push(0) ++ [_]u8{ opByte(.load16_s), opByte(.print), opByte(.halt) };
+    const base = dataBase(&shape);
+
+    // The static data holds 0xff, then 0xff 0xff.
+    const code = push(base) ++ [_]u8{ opByte(.load8_u), opByte(.print), opByte(.pop) } ++
+        push(base) ++ [_]u8{ opByte(.load8_s), opByte(.print), opByte(.pop) } ++
+        push(base + 1) ++ [_]u8{ opByte(.load16_u), opByte(.print), opByte(.pop) } ++
+        push(base + 1) ++ [_]u8{ opByte(.load16_s), opByte(.print), opByte(.halt) };
+    try std.testing.expectEqual(shape.len, code.len);
+
+    try runImage(&harness, &code, &[_]u8{ 0xff, 0xff, 0xff });
+    try std.testing.expectEqualStrings("255\n-1\n65535\n-1\n", harness.written());
+}
+
+test "a byte address means the same thing as a program address" {
+    // This is the property that the whole change is for. `push` of a data label
+    // gives a byte offset into the program image, `print_string` reads a string at
+    // that offset, and `load8_u` reads the first byte of the same string. One
+    // number, one place.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    const shape = push(0) ++ [_]u8{ opByte(.print_string), opByte(.load8_u), opByte(.print), opByte(.halt) };
+    const code = push(dataBase(&shape)) ++
+        [_]u8{ opByte(.print_string), opByte(.load8_u), opByte(.print), opByte(.halt) };
+    try std.testing.expectEqual(shape.len, code.len);
+
+    try runImage(&harness, &code, "hi\x00");
+    // "hi", then 104, which is 'h'.
+    try std.testing.expectEqualStrings("hi\n104\n", harness.written());
+}
+
+test "a store and a load of each width move a value through memory" {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    const shape = push(0) ++ push(0) ++ [_]u8{opByte(.store8)} ++
+        push(0) ++ [_]u8{ opByte(.load8_u), opByte(.print), opByte(.pop) } ++
+        push(0) ++ push(0) ++ [_]u8{opByte(.store32)} ++
+        push(0) ++ [_]u8{ opByte(.load32), opByte(.print_hex), opByte(.halt) };
+    const base = dataBase(&shape);
+
+    // Four reserved bytes follow the code region.
+    const code = push(-1) ++ push(base) ++ [_]u8{opByte(.store8)} ++
+        push(base) ++ [_]u8{ opByte(.load8_u), opByte(.print), opByte(.pop) } ++
+        push(0x12345678) ++ push(base) ++ [_]u8{opByte(.store32)} ++
+        push(base) ++ [_]u8{ opByte(.load32), opByte(.print_hex), opByte(.halt) };
+    try std.testing.expectEqual(shape.len, code.len);
+
+    try runImage(&harness, &code, &[_]u8{ 0, 0, 0, 0 });
+    // The store kept the low eight bits only, then the 32-bit store replaced all
+    // four bytes.
+    try std.testing.expectEqualStrings("255\n12345678\n", harness.written());
+}
+
+test "a 32-bit access needs no alignment" {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    const shape = push(0) ++ push(0) ++ [_]u8{opByte(.store32)} ++
+        push(0) ++ [_]u8{ opByte(.load32), opByte(.print_hex), opByte(.halt) };
+    const base = dataBase(&shape);
+    // A VM that required alignment would fault instead of giving the value back.
+    // The test is only about alignment if the address is not a multiple of four.
+    try std.testing.expect(@rem(base, 4) != 0);
+
+    const code = push(0x0a0b0c0d) ++ push(base) ++ [_]u8{opByte(.store32)} ++
+        push(base) ++ [_]u8{ opByte(.load32), opByte(.print_hex), opByte(.halt) };
+    try std.testing.expectEqual(shape.len, code.len);
+
+    const zeros: [8]u8 = @splat(0);
+    try runImage(&harness, &code, &zeros);
+    try std.testing.expectEqualStrings("0a0b0c0d\n", harness.written());
+}
+
+test "a store cannot reach the code region" {
+    // The code is read-only while a program runs. Without this rule a program could
+    // change an instruction that the verifier has already checked, and the result
+    // of that check would say nothing about what runs.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    const code = push(0) ++ push(0) ++ [_]u8{ opByte(.store8), opByte(.halt) };
+    const image = try buildContainer(.{ .code = &code, .data = &[_]u8{0} });
+    defer std.testing.allocator.free(image);
+
+    try harness.vm.loadProgram(image);
+    try std.testing.expectError(error.WriteToCodeRegion, harness.vm.run());
+    // The first instruction is unchanged.
+    try std.testing.expectEqual(opByte(.push), harness.vm.memory[0]);
+}
+
+test "the last byte of the code region is the last one a store cannot use" {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    const vm = harness.vm;
+
+    // 12 bytes of code, then 4 bytes of data. A store at 11 is the code and a store
+    // at 12 is the data.
+    const code = push(7) ++ push(12) ++ [_]u8{ opByte(.store8), opByte(.halt) };
+    try std.testing.expectEqual(@as(usize, 12), code.len);
+
+    try runImage(&harness, &code, &[_]u8{ 0, 0, 0, 0 });
+    try std.testing.expectEqual(@as(usize, 12), vm.code_len);
+    try std.testing.expectEqual(@as(u8, 7), vm.memory[12]);
+
+    // The same program one byte lower is refused.
+    var refused = Harness.init();
+    defer refused.deinit();
+    refused.start();
+
+    const into_code = push(7) ++ push(11) ++ [_]u8{ opByte(.store8), opByte(.halt) };
+    const image = try buildContainer(.{ .code = &into_code, .data = &[_]u8{ 0, 0, 0, 0 } });
+    defer std.testing.allocator.free(image);
+
+    try refused.vm.loadProgram(image);
+    try std.testing.expectError(error.WriteToCodeRegion, refused.vm.run());
+}
+
+test "a load may read the code region" {
+    // Only writing is restricted. A program can read its own instructions, which is
+    // how it reads a static value that sits in the code region of an older
+    // container.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    const code = push(0) ++ [_]u8{ opByte(.load8_u), opByte(.print), opByte(.halt) };
+    try runImage(&harness, &code, &[_]u8{0});
+    // Offset 0 holds the opcode byte of the first `push`.
+    var expected: [8]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        try std.fmt.bufPrint(&expected, "{d}\n", .{opByte(.push)}),
+        harness.written(),
+    );
+}
+
+test "an access must fit inside memory, and its width is part of that" {
+    const last: i32 = constants.memory_size - 1;
+
+    // The last byte of memory is a place to put one byte, so a one-byte access
+    // there works. Memory starts as zeros, so that is what it reads.
+    try expectOutput(
+        &(push(last) ++ [_]u8{ opByte(.load8_u), opByte(.print), opByte(.halt) }),
+        "0\n",
+    );
+    // The widest access that still fits also works.
+    try expectOutput(
+        &(push(last - 3) ++ [_]u8{ opByte(.load32), opByte(.print), opByte(.halt) }),
+        "0\n",
+    );
+
+    // The address is inside memory in each of these and the access is not, because
+    // it needs more bytes than memory has left. A check of the address on its own
+    // would read past the end.
+    try expectTrap(&(push(last) ++ [_]u8{ opByte(.load16_u), opByte(.halt) }), error.SegmentFault, "");
+    try expectTrap(&(push(last) ++ [_]u8{ opByte(.load16_s), opByte(.halt) }), error.SegmentFault, "");
+    try expectTrap(&(push(last) ++ [_]u8{ opByte(.load32), opByte(.halt) }), error.SegmentFault, "");
+    try expectTrap(
+        &(push(last - 2) ++ [_]u8{ opByte(.load32), opByte(.halt) }),
+        error.SegmentFault,
+        "",
+    );
+    // The first address fully outside memory.
+    try expectTrap(
+        &(push(constants.memory_size) ++ [_]u8{ opByte(.load8_u), opByte(.halt) }),
+        error.SegmentFault,
+        "",
+    );
+
+    // A negative address never becomes a large positive one.
+    try expectTrap(&(push(-1) ++ [_]u8{ opByte(.load8_u), opByte(.halt) }), error.SegmentFault, "");
+    try expectTrap(
+        &(push(0) ++ push(-1) ++ [_]u8{ opByte(.store8), opByte(.halt) }),
+        error.SegmentFault,
+        "",
+    );
+}
+
+test "the byte instructions check the stack before they touch memory" {
+    for ([_]bytecode.OpCode{ .load8_u, .load8_s, .load16_u, .load16_s, .load32 }) |instruction| {
+        try expectTrap(&[_]u8{ opByte(instruction), opByte(.halt) }, error.StackUnderflow, "");
+    }
+    // A store needs a value as well as an address.
+    for ([_]bytecode.OpCode{ .store8, .store16, .store32 }) |instruction| {
+        try expectTrap(&[_]u8{ opByte(instruction), opByte(.halt) }, error.StackUnderflow, "");
+        try expectTrap(
+            &(push(0) ++ [_]u8{ opByte(instruction), opByte(.halt) }),
+            error.StackUnderflow,
+            "",
+        );
+    }
+}
+
+test "a store consumes both the value and the address" {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    const code = push(5) ++ push(12) ++ [_]u8{ opByte(.store16), opByte(.halt) };
+    try std.testing.expectEqual(@as(usize, 12), code.len);
+
+    try runImage(&harness, &code, &[_]u8{ 0, 0 });
+    try std.testing.expectEqual(@as(usize, 0), harness.vm.sp);
+    try std.testing.expectEqual(@as(u8, 5), harness.vm.memory[12]);
+}
+
+test "the byte instructions and the data segment are separate spaces" {
+    // The transitional state of this stage: one number names a different place in
+    // each. `store 4` writes the fifth slot of the i32 data segment, and a byte
+    // store at 4 writes memory. Neither can see what the other wrote.
+    //
+    // This test fails when the globals move into byte-addressed memory, and that
+    // failure is the signal to update it.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    const vm = harness.vm;
+
+    const shape = push(0) ++ withAddress(.store, 4) ++
+        push(0) ++ push(0) ++ [_]u8{opByte(.store32)} ++
+        withAddress(.load, 4) ++ [_]u8{ opByte(.print), opByte(.halt) };
+    const base = dataBase(&shape);
+
+    // `store 4` writes the fifth slot of the data segment. The byte store writes
+    // four bytes of memory at the start of the static data.
+    const code = push(99) ++ withAddress(.store, 4) ++
+        push(11) ++ push(base) ++ [_]u8{opByte(.store32)} ++
+        withAddress(.load, 4) ++ [_]u8{ opByte(.print), opByte(.halt) };
+    try std.testing.expectEqual(shape.len, code.len);
+
+    const zeros: [8]u8 = @splat(0);
+    try runImage(&harness, &code, &zeros);
+    // The byte store did not change the data segment.
+    try std.testing.expectEqualStrings("99\n", harness.written());
+    try std.testing.expectEqual(@as(i32, 99), vm.data[4]);
+    try std.testing.expectEqual(@as(i32, 11), vm.readMemory(i32, @intCast(base)));
+    // And the data segment is not memory: slot 4 is not byte 4.
+    try std.testing.expectEqual(@as(u8, opByte(.push)), vm.memory[0]);
+}
+
 test "the operand form and the stack form reach the same data cell" {
     // `store 7` and `push 7` with `store_at` must name one cell. This is the
     // invariant that lets a program calculate an address, and it is the invariant

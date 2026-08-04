@@ -293,6 +293,180 @@ test "the assembler rejects a program before the VM can run it" {
     );
 }
 
+// Byte-addressed memory -----------------------------------------------------
+
+test "reserve gives a label storage that a byte store can write" {
+    // The whole point of the directive: the program names its storage and never
+    // counts a byte of its own code. If the assembler placed `counter` at the wrong
+    // address, or the VM read the address differently, the value would not come
+    // back.
+    try expectSourceOutput(
+        \\  push 1000
+        \\  push counter
+        \\  store32
+        \\  push counter
+        \\  load32
+        \\  print
+        \\  halt
+        \\counter:
+        \\  reserve 4
+    ,
+        "1000\n",
+    );
+}
+
+test "a byte address from a label reaches the same place as print_string" {
+    // This is the property the byte-addressed instructions exist for. One number is
+    // the address of the string for `print_string` and the address of its first
+    // byte for `load8_u`. The two agree, which `load_at` and a data label never did.
+    try expectSourceOutput(
+        \\  push greeting
+        \\  print_string
+        \\  load8_u
+        \\  print
+        \\  halt
+        \\greeting:
+        \\  asciiz "hi"
+    ,
+        // "hi", then 104, which is 'h'.
+        "hi\n104\n",
+    );
+}
+
+test "a narrow load from source keeps or drops the sign" {
+    try expectSourceOutput(
+        \\  push 255
+        \\  push cell
+        \\  store8
+        \\  push cell
+        \\  load8_u
+        \\  print
+        \\  pop
+        \\  push cell
+        \\  load8_s
+        \\  print
+        \\  halt
+        \\cell:
+        \\  reserve 1
+    ,
+        "255\n-1\n",
+    );
+}
+
+test "a byte string is built in memory and written out one byte at a time" {
+    // A program writes into reserved space and reads it back. This is what the new
+    // instructions make possible: a value that the program computed, in memory that
+    // it chose, at an address it worked out while running.
+    try expectSourceOutput(
+        \\  # buffer[0] = 'O', buffer[1] = 'K'
+        \\  push 79
+        \\  push buffer
+        \\  store8
+        \\  push 75
+        \\  push buffer
+        \\  push 1
+        \\  add
+        \\  store8
+        \\
+        \\  # Write the two bytes back out through a calculated address.
+        \\  push buffer
+        \\  load8_u
+        \\  write_byte
+        \\  push buffer
+        \\  push 1
+        \\  add
+        \\  load8_u
+        \\  write_byte
+        \\  push 10
+        \\  write_byte
+        \\  halt
+        \\buffer:
+        \\  reserve 2
+    ,
+        "OK\n",
+    );
+}
+
+test "an array of 32-bit values is summed through calculated byte addresses" {
+    // The byte-addressed form of the data-segment loop. The stride is four bytes
+    // rather than one slot, which is what a C compiler emits for `int[]`.
+    try expectSourceOutput(
+        \\entry main
+        \\main:
+        \\  # numbers[i] = (i + 1) * 10, for i in 0..3
+        \\  push 10
+        \\  push numbers
+        \\  store32
+        \\  push 20
+        \\  push numbers
+        \\  push 4
+        \\  add
+        \\  store32
+        \\  push 30
+        \\  push numbers
+        \\  push 8
+        \\  add
+        \\  store32
+        \\
+        \\  # total = 0, cursor = numbers
+        \\  push 0
+        \\  store 0
+        \\  push numbers
+        \\  store 1
+        \\loop:
+        \\  load 0
+        \\  load 1
+        \\  load32
+        \\  add
+        \\  store 0
+        \\  load 1
+        \\  push 4
+        \\  add
+        \\  store 1
+        \\  load 1
+        \\  push numbers
+        \\  push 12
+        \\  add
+        \\  ne
+        \\  jmp_not_zero loop
+        \\  load 0
+        \\  print
+        \\  halt
+        \\numbers:
+        \\  reserve 12
+    ,
+        "60\n",
+    );
+}
+
+test "a store into the code region is refused" {
+    // Address 0 is the first byte of the code. A program that could write there
+    // would make the work of the verifier meaningless, because the bytes it checked
+    // are not the bytes that would run.
+    try expectSourceTrap(
+        \\  push 255
+        \\  push 0
+        \\  store8
+        \\  halt
+    ,
+        error.WriteToCodeRegion,
+        "",
+    );
+}
+
+test "a read of the code region is allowed" {
+    // Only writing is restricted. Offset 0 holds the opcode byte of `push`, which
+    // is 1.
+    try expectSourceOutput(
+        \\  push 0
+        \\  load8_u
+        \\  print
+        \\  halt
+    ,
+        "1\n",
+    );
+}
+
 test "the assembler and the VM agree on the bound of the data segment" {
     // The assembler runs the verifier without a segment size, so it accepts this
     // operand. The VM knows the size, so its own verification refuses the program
