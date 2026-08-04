@@ -91,46 +91,48 @@ test "a program from source assembles, verifies and runs" {
     );
 }
 
-test "the data-segment operand and the stack address name the same cell" {
-    // This is the invariant that lets a program calculate an address. `store 4`
-    // and `push 4` with `store_at` must reach one cell, and not two. A change to
+test "the operand form and the stack address name the same bytes" {
+    // This is the invariant that lets a program calculate an address. `store cell`
+    // and `push cell` with `store_at` must reach one place, and not two. A change to
     // one of the two forms without the other makes this test fail.
     try expectSourceOutput(
         \\  push 99
-        \\  store 4         # the operand form writes the cell
-        \\  push 4
-        \\  load_at         # the stack form reads the same cell
+        \\  store cell      # the operand form writes it
+        \\  push cell
+        \\  load_at         # the stack form reads the same bytes
         \\  print
         \\  push 123
-        \\  push 4
+        \\  push cell
         \\  store_at        # the stack form writes it
-        \\  load 4          # the operand form reads it back
+        \\  load cell       # the operand form reads it back
         \\  print
         \\  halt
+        \\cell:
+        \\  reserve 4
     ,
         "99\n123\n",
     );
 }
 
-test "a data label is a byte offset into the image, not a data-segment index" {
-    // One number, two meanings. `print_string` reads it as a byte offset into the
-    // program image and finds the string. `load_at` reads it as an index into the
-    // i32 data segment and finds an unrelated cell, which is zero.
+test "the address of a global is a usable pointer" {
+    // This test once recorded the opposite. A data label was a byte offset into the
+    // image, and the operand of `load` was an index into a separate segment of i32
+    // slots, so one number named two places.
     //
-    // This test records the two address spaces that the VM has today. The move to
-    // one byte-addressed guest memory is what removes the difference. Therefore
-    // this test is expected to fail at that point, and its failure is the signal
-    // to update it rather than a regression.
+    // Now `store counter` and a byte-addressed read of `push counter` reach the same
+    // four bytes. Therefore the address of a global is an ordinary value that a
+    // program can compute with, and that is what a pointer is.
     try expectSourceOutput(
-        \\  push greeting
-        \\  print_string
-        \\  load_at
+        \\  push 12345
+        \\  store counter   # write the global by name
+        \\  push counter    # take its address
+        \\  load32          # read it through that address
         \\  print
         \\  halt
-        \\greeting:
-        \\  asciiz "hi"
+        \\counter:
+        \\  reserve 4
     ,
-        "hi\n0\n",
+        "12345\n",
     );
 }
 
@@ -191,57 +193,23 @@ test "the entry directive skips a prologue that never runs" {
     );
 }
 
-test "a loop walks an array through calculated data addresses" {
-    // The source-level form of the indirect-addressing test in `machine.zig`.
-    // total is at 100 and the index is at 101.
-    try expectSourceOutput(
-        \\  push 10
-        \\  store 0
-        \\  push 20
-        \\  store 1
-        \\  push 30
-        \\  store 2
-        \\  push 0
-        \\  store 100
-        \\  push 0
-        \\  store 101
-        \\loop:
-        \\  load 100
-        \\  load 101
-        \\  load_at
-        \\  add
-        \\  store 100
-        \\  load 101
-        \\  push 1
-        \\  add
-        \\  store 101
-        \\  load 101
-        \\  push 3
-        \\  ne
-        \\  jmp_not_zero loop
-        \\  load 100
-        \\  print
-        \\  halt
-    ,
-        "60\n",
-    );
-}
-
 test "a backward jump makes a countdown loop" {
     try expectSourceOutput(
         \\  push 3
-        \\  store 0
+        \\  store counter
         \\loop:
-        \\  load 0
+        \\  load counter
         \\  print
         \\  pop
-        \\  load 0
+        \\  load counter
         \\  push 1
         \\  sub
-        \\  store 0
-        \\  load 0
+        \\  store counter
+        \\  load counter
         \\  jmp_not_zero loop
         \\  halt
+        \\counter:
+        \\  reserve 4
     ,
         "3\n2\n1\n",
     );
@@ -402,30 +370,32 @@ test "an array of 32-bit values is summed through calculated byte addresses" {
         \\
         \\  # total = 0, cursor = numbers
         \\  push 0
-        \\  store 0
+        \\  store total
         \\  push numbers
-        \\  store 1
+        \\  store cursor
         \\loop:
-        \\  load 0
-        \\  load 1
+        \\  load total
+        \\  load cursor
         \\  load32
         \\  add
-        \\  store 0
-        \\  load 1
+        \\  store total
+        \\  load cursor
         \\  push 4
         \\  add
-        \\  store 1
-        \\  load 1
-        \\  push numbers
-        \\  push 12
-        \\  add
+        \\  store cursor
+        \\  load cursor
+        \\  push numbers+12
         \\  ne
         \\  jmp_not_zero loop
-        \\  load 0
+        \\  load total
         \\  print
         \\  halt
         \\numbers:
         \\  reserve 12
+        \\total:
+        \\  reserve 4
+        \\cursor:
+        \\  reserve 4
     ,
         "60\n",
     );
@@ -459,12 +429,12 @@ test "a read of the code region is allowed" {
     );
 }
 
-test "the assembler and the VM agree on the bound of the data segment" {
-    // The assembler runs the verifier without a segment size, so it accepts this
-    // operand. The VM knows the size, so its own verification refuses the program
-    // at load time. This test fails if the two stop agreeing on which addresses
-    // exist, which is what changes when the data segment becomes byte-addressed.
-    const source = std.fmt.comptimePrint("store {d}\nhalt", .{constants.data_size});
+test "the assembler and the VM divide the address checks between them" {
+    // The assembler does not know the size of the memory of the VM that will run the
+    // program, so it accepts this operand. The VM knows that size, so its own
+    // verification refuses the program when it loads it. This test fails if the two
+    // stop agreeing about which addresses exist.
+    const source = std.fmt.comptimePrint("store {d}\nhalt", .{constants.memory_size});
     const program = try assembler.assemble(std.testing.allocator, source, null);
     defer std.testing.allocator.free(program);
 
@@ -474,7 +444,14 @@ test "the assembler and the VM agree on the bound of the data segment" {
 
     try std.testing.expectError(error.DataAddressOutOfRange, harness.vm.loadProgram(program));
 
-    // The highest address that does exist assembles and loads.
-    const last = std.fmt.comptimePrint("push 5\nstore {d}\nhalt", .{constants.data_size - 1});
+    // The assembler does know the length of the code, so it refuses a store that
+    // would write an instruction without asking the VM.
+    try std.testing.expectError(
+        error.StoreIntoCodeRegion,
+        assembler.assemble(std.testing.allocator, "push 5\nstore 0\nhalt", null),
+    );
+
+    // The highest address that a four-byte store can use does assemble and load.
+    const last = std.fmt.comptimePrint("push 5\nstore {d}\nhalt", .{constants.memory_size - 4});
     try expectSourceOutput(last, "");
 }

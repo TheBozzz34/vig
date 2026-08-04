@@ -22,16 +22,6 @@ pub const memory_size = 65536;
 // The size of the stack of the VM.
 pub const stack_size = 256;
 
-// The size of the data segment of the VM. The `load` and `store` instructions
-// use this segment.
-//
-// This segment is an array of i32 slots and it is not part of the memory above. A
-// number therefore names a different place in each: `load 4` reads the fifth slot
-// of this segment, and `load32` with 4 on the stack reads the four bytes at offset
-// 4 of that memory. The globals move out of here and into that memory in a later
-// stage, and this segment goes away with them.
-pub const data_size = 4096;
-
 // The size of the call stack of the VM. The `call` and `ret` instructions use
 // this stack.
 pub const call_stack_size = 128;

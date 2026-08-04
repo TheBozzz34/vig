@@ -14,12 +14,13 @@ const Io = std.Io;
 /// inline, so it is far larger than a machine register and it grows with
 /// `constants.memory_size`.
 pub const VM = struct {
-    // The memory and the stack: an array of bytes and an array of integers.
+    // The guest address space: one array of bytes. Every instruction that touches
+    // guest data addresses this array by byte, and a label, a pointer and the
+    // operand of `load` all mean the same kind of number.
     memory: [constants.memory_size]u8,
-    stack: [constants.stack_size]i32,
 
-    // The data segment for the `load` and `store` instructions.
-    data: [constants.data_size]i32,
+    // The evaluation stack.
+    stack: [constants.stack_size]i32,
 
     // The call stack for the `call` and `ret` instructions.
     call_stack: [constants.call_stack_size]usize,
@@ -32,9 +33,12 @@ pub const VM = struct {
     // Execution and each jump target must stay inside this length.
     code_len: usize = 0,
 
-    // The number of bytes in the complete program image: the code region, then
-    // the static-data region. An address from the program must stay inside this
-    // length.
+    // The number of bytes in the complete program image: the code region, then the
+    // static-data region, then the zero-filled region that the header declares. An
+    // address from the program must stay inside this length.
+    //
+    // The zero-filled region is part of the image but not part of the file.
+    // Therefore a program can declare a large array, and the file stays small.
     program_len: usize = 0,
 
     // The destination for the output of `print` and `print_string`. This writer
@@ -68,7 +72,7 @@ pub const VM = struct {
     pub fn reset(self: *VM) void {
         self.clearForeignImports();
         @memset(&self.stack, 0);
-        @memset(&self.data, 0);
+        @memset(&self.memory, 0);
         @memset(&self.call_stack, 0);
 
         self.code_len = 0;
@@ -89,7 +93,6 @@ pub const VM = struct {
         self.* = .{
             .memory = @splat(0),
             .stack = @splat(0),
-            .data = @splat(0),
             .call_stack = @splat(0),
             .csp = 0,
             .foreign_imports = @splat(null),
@@ -105,24 +108,33 @@ pub const VM = struct {
         };
     }
 
-    // Load a program into the memory of the VM. The file can be a current
-    // container, a version 1 container, or bare code with no header.
-    // `container.parse` finds which form the file has.
+    // Load a program into the memory of the VM. The file can be a current container
+    // or bare code with no header. `container.parse` finds which form the file has.
     pub fn loadProgram(self: *VM, program: []const u8) !void {
         self.reset();
         errdefer self.clearForeignImports();
 
         const image = try container.parse(program);
+
+        // A version 1 container and a version 2 container are refused. In each one
+        // the operand of `load` and of `store` is an index into a segment of i32
+        // slots, and that operand is now a byte address in this memory. The
+        // instruction did not change, so nothing in the file says which meaning it
+        // has. A VM that ran such a file would compute a wrong answer and report
+        // nothing. Therefore it must refuse the file instead.
+        if (!image.kind.isExecutable()) return error.ObsoleteProgramFormat;
+
         if (image.imageLen() > self.memory.len) return error.ProgramTooLarge;
 
-        // Only the current format keeps the code apart from the static data. The
-        // verifier needs this split to read the instructions and to decode no
-        // string. An older program runs with the checks in `run` on each
-        // instruction.
+        // Only a container keeps the code apart from the static data. The verifier
+        // needs this split to read the instructions and to decode no string. Bare
+        // code runs with the checks in `run` on each instruction.
         if (image.kind.separatesData()) try self.verifyImage(image);
 
         try self.loadForeignImports(image);
 
+        // The file holds the code and the static data. The zero-filled region needs
+        // no copy, because `reset` has already cleared the whole of memory.
         @memcpy(self.memory[0..image.code.len], image.code);
         @memcpy(self.memory[image.code.len..][0..image.data.len], image.data);
 
@@ -307,24 +319,24 @@ pub const VM = struct {
                     }
                 },
                 .load => {
-                    const address = try self.operandAddress(try utils.readU32(self));
+                    const address = try self.operandAddress(try utils.readU32(self), .read);
 
                     if (self.sp >= self.stack.len) {
                         return error.StackOverflow;
                     }
 
-                    self.stack[self.sp] = self.readData(address);
+                    self.stack[self.sp] = self.readMemory(i32, address);
                     self.sp += 1;
                 },
                 .store => {
-                    const address = try self.operandAddress(try utils.readU32(self));
+                    const address = try self.operandAddress(try utils.readU32(self), .write);
 
                     if (self.sp == 0) {
                         return error.StackUnderflow;
                     }
 
                     self.sp -= 1;
-                    self.writeData(address, self.stack[self.sp]);
+                    self.writeMemory(u32, address, @bitCast(self.stack[self.sp]));
                 },
                 .call => {
                     const target = try utils.readU32(self);
@@ -360,24 +372,13 @@ pub const VM = struct {
                     const string = try self.guestCString(self.stack[self.sp - 1]);
                     try self.output.print("{s}\n", .{string});
                 },
-                .load_at => {
-                    // The address comes from the stack, and not from the operand
-                    // of `load`. Therefore the program can calculate a data
-                    // address while it runs.
-                    if (self.sp == 0) return error.StackUnderflow;
-
-                    const address = try self.dataAddress(self.stack[self.sp - 1]);
-                    self.stack[self.sp - 1] = self.readData(address);
-                },
-                .store_at => {
-                    if (self.sp < 2) return error.StackUnderflow;
-
-                    const address = try self.dataAddress(self.stack[self.sp - 1]);
-                    const value = self.stack[self.sp - 2];
-
-                    self.sp -= 2;
-                    self.writeData(address, value);
-                },
+                // The address comes from the stack, and not from the operand of
+                // `load`. Therefore the program can calculate an address while it
+                // runs. Each of these two is now the same instruction as its
+                // 32-bit byte-addressed form, and the older name is kept so a
+                // program that used it needs no change.
+                .load_at => try self.loadFrom(i32),
+                .store_at => try self.storeTo(u32),
                 .@"and" => {
                     if (self.sp < 2) return error.StackUnderflow;
                     self.sp -= 1;
@@ -519,63 +520,30 @@ pub const VM = struct {
     // Guest memory ------------------------------------------------------------
     //
     // Each read and each write of guest data goes through this section. No
-    // instruction in `run` reaches `self.data` or `self.memory` on its own.
+    // instruction in `run` reaches `self.memory` on its own.
     //
-    // The VM has two address spaces at this time. The data segment is an array of
-    // i32 slots, and `load`, `store`, `load_at` and `store_at` index it by slot.
-    // The program image is an array of bytes, and a guest pointer indexes it by
-    // byte. One number therefore means two different places, and a program cannot
-    // use it for both.
+    // There is one address space. It is `memory`, and every address is a byte offset
+    // into it. A label, a pointer, the operand of `load` and an address that a
+    // program calculated are all the same kind of number. Therefore a program can
+    // take the address of a global and use it, and that is what makes a pointer, an
+    // array and a structure possible.
 
-    // Check a data-segment address from the stack. A negative value has no
-    // unsigned equivalent. Therefore a negative value gives a fault. It does not
-    // become a large positive value.
-    fn dataAddress(self: *const VM, value: i32) !usize {
-        if (value < 0) return error.SegmentFault;
-        return self.operandAddress(@intCast(value));
-    }
-
-    // The same check for an address that came from the operand of an instruction.
-    // The encoding of that operand is unsigned, so it needs no sign test, but the
-    // bound must be the one that `dataAddress` uses. If the two disagreed, then
-    // `store 4` and `push 4` with `store_at` could reach different cells.
-    fn operandAddress(self: *const VM, address: u32) !usize {
-        const index: usize = address;
-        if (index >= self.data.len) return error.SegmentFault;
-        return index;
-    }
-
-    // Read and write one data-segment cell. The caller has already checked the
-    // address. These two functions are the only place that indexes `data`, and
-    // they become a byte-addressed access of a given width.
-    fn readData(self: *const VM, address: usize) i32 {
-        return self.data[address];
-    }
-
-    fn writeData(self: *VM, address: usize, value: i32) void {
-        self.data[address] = value;
-    }
-
-    // The first address that a guest pointer cannot use. A pointer names a byte in
-    // the program image, which is the code region and then the static data. When
-    // the globals, the frames and a heap move into one memory, this limit grows to
-    // take in those regions, and `guestPointer` and `guestCString` both follow it.
+    // The first address that a guest pointer cannot use. A pointer names a byte of
+    // the program image: the code, then the static data, then the zero-filled
+    // region. A program can therefore build a string in that region and print it.
     //
+    // The limit is the image and not the whole of memory. Memory above the image
+    // starts as zeros, so every address in it would look like the end of a string,
+    // and `UnterminatedGuestString` would stop meaning anything.
     fn guestPointerLimit(self: *const VM) usize {
         return self.program_len;
     }
 
     // Byte-addressed access ---------------------------------------------------
     //
-    // These are the instructions that address guest memory by byte, and they are
-    // the form that a C compiler emits. An address is a byte offset into `memory`,
-    // so it means the same thing as an address that a program pushes for
-    // `print_string` or gives to a foreign function.
-    //
-    // The i32 data segment above is a separate space that `load` and `store` still
-    // index by slot. The two do not overlap and a number means a different place in
-    // each. That is the state of this stage: these instructions arrive first, and
-    // the globals move out of the slot-indexed segment afterwards.
+    // Every instruction that touches guest data arrives here. `load` and `store`
+    // bring an address from their operand, and the rest bring one from the stack.
+    // The width of the access comes from the instruction.
 
     /// Whether an access reads guest memory or writes it.
     const Access = enum { read, write };
@@ -603,8 +571,21 @@ pub const VM = struct {
     /// is nothing, because the read and the write below do not need alignment.
     fn memoryAddress(self: *const VM, value: i32, width: usize, access: Access) !usize {
         if (value < 0) return error.SegmentFault;
-        const address: usize = @intCast(value);
+        return self.checkAccess(@intCast(value), width, access);
+    }
 
+    /// The same check for the address in the operand of `load` or of `store`.
+    ///
+    /// The encoding of that operand is unsigned, so it needs no test of its sign. But
+    /// the rest of the check must be the one that an address from the stack gets. If
+    /// the two differed, then `store 4` and `push 4` with `store_at` could reach
+    /// different bytes, and the one address space would not be one after all.
+    fn operandAddress(self: *const VM, address: u32, access: Access) !usize {
+        return self.checkAccess(@as(usize, address), 4, access);
+    }
+
+    /// The bound and the write floor, for an access of `width` bytes at `address`.
+    fn checkAccess(self: *const VM, address: usize, width: usize, access: Access) !usize {
         // Written as a subtraction so it cannot overflow, whatever the width.
         if (width > self.memory.len or address > self.memory.len - width) {
             return error.SegmentFault;
@@ -683,7 +664,12 @@ pub const VM = struct {
             .code = image.code,
             .entry_point = image.header.entry_point,
             .import_count = image.header.import_count,
-            .data_slots = constants.data_size,
+            // The VM knows the size of its memory and the length of the code.
+            // Therefore an address in a `load` or a `store` operand, and a `store`
+            // that would write an instruction, are both found before any of the
+            // program runs.
+            .memory_size = constants.memory_size,
+            .code_len = @intCast(image.code.len),
         }, &self.verify_scratch, &failure) catch |err| {
             self.verification_failure = failure;
             return err;
@@ -978,27 +964,45 @@ test "a program larger than VM memory is rejected" {
     try std.testing.expectError(error.ProgramTooLarge, harness.vm.loadProgram(program));
 }
 
-test "bare code and version 1 containers still load" {
+test "bare code still loads" {
     var harness = Harness.init();
     defer harness.deinit();
     harness.start();
     const vm = harness.vm;
 
-    // Code with no header, as in the first VIG programs.
+    // Code with no header, as in the first VIG programs. This form carries no
+    // version, so no promise about it changed, and it is the only input that reaches
+    // the run-time checks of the VM.
     try vm.loadProgram(&(push(1) ++ [_]u8{ opByte(.print), opByte(.halt) }));
     try vm.run();
     try std.testing.expectEqualStrings("1\n", harness.written());
+}
 
-    // A version 1 container has no split of the code from the data. Therefore the
-    // string is in the code region at offset 7, and no verifier checks the
-    // program.
+test "a version 1 or version 2 container is refused" {
+    // Each of these is a numbered format in which the operand of `load` and of
+    // `store` is an index into a segment of i32 slots. That operand is a byte address
+    // now. The instruction did not change, so nothing in the file says which meaning
+    // it has, and a VM that ran the file would compute a wrong answer in silence.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    const vm = harness.vm;
+
     const legacy = "VIGF" ++ [_]u8{ 1, 0 } ++
         push(7) ++ [_]u8{ opByte(.print_string), opByte(.halt) } ++ "again\x00";
-    try vm.loadProgram(legacy);
-    try std.testing.expectEqual(@as(usize, 13), vm.code_len);
-    try std.testing.expectEqual(vm.code_len, vm.program_len);
-    try vm.run();
-    try std.testing.expectEqualStrings("1\nagain\n", harness.written());
+    try std.testing.expectError(error.ObsoleteProgramFormat, vm.loadProgram(legacy));
+
+    // A version 2 header, which is four bytes shorter than the current one.
+    var header: [container.header_size]u8 = undefined;
+    container.writeHeader(.{
+        .format_version = container.slot_addressed_version,
+        .code_len = 1,
+    }, &header);
+    const slot_addressed = header[0..container.slot_addressed_header_size] ++ [_]u8{opByte(.halt)};
+    try std.testing.expectError(error.ObsoleteProgramFormat, vm.loadProgram(slot_addressed));
+
+    // The VM loaded no program. Therefore it can run no instruction.
+    try std.testing.expectEqual(@as(usize, 0), vm.code_len);
 }
 
 test "resolves and invokes a zero-argument Windows API" {
@@ -1009,11 +1013,14 @@ test "resolves and invokes a zero-argument Windows API" {
     harness.start();
     const vm = harness.vm;
 
-    const program = "VIGF" ++ [_]u8{ 1, 1, 12, 19, 0 } ++
-        "kernel32.dllGetCurrentProcessId" ++ [_]u8{
-        @intFromEnum(bytecode.OpCode.foreign_call), 0,
-        @intFromEnum(bytecode.OpCode.halt),
-    };
+    // The import table is part of the container, so the program is built rather than
+    // written out as bytes.
+    const program = try buildContainer(.{
+        .imports = &.{.{ .library = "kernel32.dll", .symbol = "GetCurrentProcessId" }},
+        .code = &[_]u8{ opByte(.foreign_call), 0, opByte(.halt) },
+    });
+    defer std.testing.allocator.free(program);
+
     try vm.loadProgram(program);
     try vm.run();
 
@@ -1178,18 +1185,20 @@ test "call and ret run a subroutine and resume after it" {
     try expectOutput(&program, "5\n");
 }
 
-test "load and store move values through the data segment" {
-    const program = push(99) ++ withAddress(.store, 3) ++
-        withAddress(.load, 3) ++ [_]u8{ opByte(.print), opByte(.halt) };
+test "load and store move a value through guest memory" {
+    // The operand is a byte address. It is above the code, because a store must not
+    // write an instruction.
+    const program = push(99) ++ withAddress(.store, 300) ++
+        withAddress(.load, 300) ++ [_]u8{ opByte(.print), opByte(.halt) };
     try expectOutput(&program, "99\n");
 }
 
-test "load_at and store_at address the data segment at runtime" {
-    // Put 77 into data[4] with a calculated address (2 + 2). Then read it in the
-    // same way.
-    const program = push(77) ++ push(2) ++ push(2) ++ [_]u8{opByte(.add)} ++
+test "load_at and store_at address memory at runtime" {
+    // Put 77 at address 400 with a calculated address (200 + 200). Then read it in
+    // the same way.
+    const program = push(77) ++ push(200) ++ push(200) ++ [_]u8{opByte(.add)} ++
         [_]u8{opByte(.store_at)} ++
-        push(4) ++ [_]u8{ opByte(.load_at), opByte(.print), opByte(.halt) };
+        push(400) ++ [_]u8{ opByte(.load_at), opByte(.print), opByte(.halt) };
     try expectOutput(&program, "77\n");
 }
 
@@ -1198,50 +1207,58 @@ test "store_at consumes both the value and the address" {
     defer harness.deinit();
     harness.start();
 
-    const program = push(5) ++ push(1) ++ [_]u8{ opByte(.store_at), opByte(.halt) };
+    // The address is above the code, because a store must not write an instruction.
+    const program = push(5) ++ push(100) ++ [_]u8{ opByte(.store_at), opByte(.halt) };
     try harness.vm.loadProgram(&program);
     try harness.vm.run();
 
     try std.testing.expectEqual(@as(usize, 0), harness.vm.sp);
-    try std.testing.expectEqual(@as(i32, 5), harness.vm.data[1]);
+    try std.testing.expectEqual(@as(i32, 5), harness.vm.readMemory(i32, 100));
 }
 
-test "indirect addressing walks an array in the data segment" {
-    // Put 10, 20 and 30 into data[0..3]. Then add them in a loop that calculates
-    // each address.
+test "a loop walks an array through calculated byte addresses" {
+    // Put 10, 20 and 30 in an array of three i32 values. Then add them in a loop
+    // that calculates each address.
+    //
+    // The stride is four bytes and not one slot, which is what a C compiler emits
+    // for an `int` array. Every address is above the code, because a store must not
+    // write an instruction.
+    const array: u32 = 1000;
+    const total: u32 = 2000;
+    const cursor: u32 = 2004;
+
     var program = std.ArrayList(u8).empty;
     defer program.deinit(std.testing.allocator);
 
     inline for (.{ 10, 20, 30 }, 0..) |value, index| {
         try program.appendSlice(std.testing.allocator, &push(value));
-        try program.appendSlice(std.testing.allocator, &withAddress(.store, index));
+        try program.appendSlice(std.testing.allocator, &withAddress(.store, array + index * 4));
     }
 
-    // data[100] holds the total. data[101] holds the index.
     try program.appendSlice(std.testing.allocator, &push(0));
-    try program.appendSlice(std.testing.allocator, &withAddress(.store, 100));
-    try program.appendSlice(std.testing.allocator, &push(0));
-    try program.appendSlice(std.testing.allocator, &withAddress(.store, 101));
+    try program.appendSlice(std.testing.allocator, &withAddress(.store, total));
+    try program.appendSlice(std.testing.allocator, &push(@intCast(array)));
+    try program.appendSlice(std.testing.allocator, &withAddress(.store, cursor));
 
     const loop_start: u32 = @intCast(program.items.len);
-    // total = total + data[index]
-    try program.appendSlice(std.testing.allocator, &withAddress(.load, 100));
-    try program.appendSlice(std.testing.allocator, &withAddress(.load, 101));
-    try program.append(std.testing.allocator, opByte(.load_at));
+    // total = total + the four bytes at cursor
+    try program.appendSlice(std.testing.allocator, &withAddress(.load, total));
+    try program.appendSlice(std.testing.allocator, &withAddress(.load, cursor));
+    try program.append(std.testing.allocator, opByte(.load32));
     try program.append(std.testing.allocator, opByte(.add));
-    try program.appendSlice(std.testing.allocator, &withAddress(.store, 100));
-    // index = index + 1
-    try program.appendSlice(std.testing.allocator, &withAddress(.load, 101));
-    try program.appendSlice(std.testing.allocator, &push(1));
+    try program.appendSlice(std.testing.allocator, &withAddress(.store, total));
+    // cursor = cursor + 4
+    try program.appendSlice(std.testing.allocator, &withAddress(.load, cursor));
+    try program.appendSlice(std.testing.allocator, &push(4));
     try program.append(std.testing.allocator, opByte(.add));
-    try program.appendSlice(std.testing.allocator, &withAddress(.store, 101));
-    // Continue the loop while the index is not 3.
-    try program.appendSlice(std.testing.allocator, &withAddress(.load, 101));
-    try program.appendSlice(std.testing.allocator, &push(3));
+    try program.appendSlice(std.testing.allocator, &withAddress(.store, cursor));
+    // Continue the loop until the cursor passes the last element.
+    try program.appendSlice(std.testing.allocator, &withAddress(.load, cursor));
+    try program.appendSlice(std.testing.allocator, &push(@intCast(array + 12)));
     try program.append(std.testing.allocator, opByte(.ne));
     try program.appendSlice(std.testing.allocator, &withAddress(.jmp_not_zero, loop_start));
 
-    try program.appendSlice(std.testing.allocator, &withAddress(.load, 100));
+    try program.appendSlice(std.testing.allocator, &withAddress(.load, total));
     try program.append(std.testing.allocator, opByte(.print));
     try program.append(std.testing.allocator, opByte(.halt));
 
@@ -1273,25 +1290,41 @@ test "traps report the failure and keep output printed before it" {
     try expectTrap(&[_]u8{0xfe}, error.InvalidInstruction, "");
 }
 
-test "indirect addressing faults outside the data segment" {
-    // The bounds come from `data_size` and not from a literal. Therefore a change
-    // to the size of the segment cannot leave this test checking an address that
-    // is inside the segment.
-    const last: i32 = constants.data_size - 1;
-    const past_end: i32 = constants.data_size;
+test "load_at and store_at are the 32-bit byte-addressed instructions" {
+    // The two older names do exactly what `load32` and `store32` do. A program that
+    // used them needs no change, and there is no second address space left for them
+    // to reach. Therefore a value written with one name reads back with the other.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
 
-    // The highest address in the segment still works. Without this case, a test
-    // that only checks the addresses outside the segment also passes when every
-    // address faults.
-    try expectOutput(&(push(last) ++ [_]u8{ opByte(.load_at), opByte(.print), opByte(.halt) }), "0\n");
+    const program = push(0x11223344) ++ push(200) ++ [_]u8{opByte(.store_at)} ++
+        push(200) ++ [_]u8{ opByte(.load32), opByte(.print_hex), opByte(.pop) } ++
+        push(0x55667788) ++ push(300) ++ [_]u8{opByte(.store32)} ++
+        push(300) ++ [_]u8{ opByte(.load_at), opByte(.print_hex), opByte(.halt) };
 
-    try expectTrap(&(push(past_end) ++ [_]u8{ opByte(.load_at), opByte(.halt) }), error.SegmentFault, "");
-    try expectTrap(&(push(-1) ++ [_]u8{ opByte(.load_at), opByte(.halt) }), error.SegmentFault, "");
+    try harness.vm.loadProgram(&program);
+    try harness.vm.run();
+    try std.testing.expectEqualStrings("11223344\n55667788\n", harness.written());
+}
+
+test "a calculated address is bounded, and its width is part of the bound" {
+    const last: i32 = constants.memory_size - 1;
+
+    // The widest access that still fits works.
+    try expectOutput(
+        &(push(last - 3) ++ [_]u8{ opByte(.load_at), opByte(.print), opByte(.halt) }),
+        "0\n",
+    );
+
+    // One byte further needs four bytes and has three.
+    try expectTrap(&(push(last - 2) ++ [_]u8{ opByte(.load_at), opByte(.halt) }), error.SegmentFault, "");
     try expectTrap(
-        &(push(0) ++ push(past_end) ++ [_]u8{ opByte(.store_at), opByte(.halt) }),
+        &(push(constants.memory_size) ++ [_]u8{ opByte(.load_at), opByte(.halt) }),
         error.SegmentFault,
         "",
     );
+    try expectTrap(&(push(-1) ++ [_]u8{ opByte(.load_at), opByte(.halt) }), error.SegmentFault, "");
     try expectTrap(
         &(push(0) ++ push(-1) ++ [_]u8{ opByte(.store_at), opByte(.halt) }),
         error.SegmentFault,
@@ -1414,14 +1447,19 @@ test "a foreign call to an import that does not exist gives a fault" {
     );
 }
 
-test "the data segment is bounded at run time and not only by the verifier" {
-    // A current container has its `load` and `store` addresses checked at load
-    // time. A program with no header has no such check, so the same bound has to
-    // hold while it runs. Both forms of the address need it.
-    const past_end: u32 = constants.data_size;
+test "a load or store operand is bounded at run time and not only by the verifier" {
+    // A container has its `load` and `store` operands checked at load time. Bare
+    // code has no such check, so the same rules must hold while it runs.
+    const past_end: u32 = constants.memory_size;
 
     try expectTrap(
         &(withAddress(.load, past_end) ++ [_]u8{opByte(.halt)}),
+        error.SegmentFault,
+        "",
+    );
+    // Three bytes from the end is inside memory, but its four-byte access is not.
+    try expectTrap(
+        &(withAddress(.load, constants.memory_size - 3) ++ [_]u8{opByte(.halt)}),
         error.SegmentFault,
         "",
     );
@@ -1430,17 +1468,33 @@ test "the data segment is bounded at run time and not only by the verifier" {
         error.SegmentFault,
         "",
     );
+    // A `store` into the code is refused while it runs, too.
+    try expectTrap(
+        &(push(0) ++ withAddress(.store, 0) ++ [_]u8{opByte(.halt)}),
+        error.WriteToCodeRegion,
+        "",
+    );
 
-    // The same program in a current container never runs at all.
-    const image = try buildContainer(.{
+    // The same programs in a container never run at all.
+    const out_of_range = try buildContainer(.{
         .code = &(withAddress(.load, past_end) ++ [_]u8{opByte(.halt)}),
     });
-    defer std.testing.allocator.free(image);
+    defer std.testing.allocator.free(out_of_range);
 
     var harness = Harness.init();
     defer harness.deinit();
     harness.start();
-    try std.testing.expectError(error.DataAddressOutOfRange, harness.vm.loadProgram(image));
+    try std.testing.expectError(error.DataAddressOutOfRange, harness.vm.loadProgram(out_of_range));
+
+    const into_code = try buildContainer(.{
+        .code = &(push(0) ++ withAddress(.store, 0) ++ [_]u8{opByte(.halt)}),
+    });
+    defer std.testing.allocator.free(into_code);
+
+    var refused = Harness.init();
+    defer refused.deinit();
+    refused.start();
+    try std.testing.expectError(error.StoreIntoCodeRegion, refused.vm.loadProgram(into_code));
 }
 
 // Byte-addressed access ------------------------------------------------------
@@ -1686,56 +1740,48 @@ test "a store consumes both the value and the address" {
     try std.testing.expectEqual(@as(u8, 5), harness.vm.memory[12]);
 }
 
-test "the byte instructions and the data segment are separate spaces" {
-    // The transitional state of this stage: one number names a different place in
-    // each. `store 4` writes the fifth slot of the i32 data segment, and a byte
-    // store at 4 writes memory. Neither can see what the other wrote.
+test "a global and a byte address are the same address" {
+    // There was a time when this test recorded the opposite. The operand of `store`
+    // was an index into a separate segment of i32 slots, and a byte store at the same
+    // number reached a different place. Neither could see what the other wrote.
     //
-    // This test fails when the globals move into byte-addressed memory, and that
-    // failure is the signal to update it.
+    // Now there is one address space. `store <n>` and a byte store at `n` write the
+    // same four bytes. That is what lets a program take the address of a global, and
+    // therefore what makes a pointer possible.
     var harness = Harness.init();
     defer harness.deinit();
     harness.start();
     const vm = harness.vm;
 
-    const shape = push(0) ++ withAddress(.store, 4) ++
-        push(0) ++ push(0) ++ [_]u8{opByte(.store32)} ++
-        withAddress(.load, 4) ++ [_]u8{ opByte(.print), opByte(.halt) };
-    const base = dataBase(&shape);
+    const global: u32 = 500;
+    const code = push(99) ++ withAddress(.store, global) ++
+        push(@intCast(global)) ++ [_]u8{ opByte(.load32), opByte(.print), opByte(.pop) } ++
+        push(77) ++ push(@intCast(global)) ++ [_]u8{opByte(.store32)} ++
+        withAddress(.load, global) ++ [_]u8{ opByte(.print), opByte(.halt) };
 
-    // `store 4` writes the fifth slot of the data segment. The byte store writes
-    // four bytes of memory at the start of the static data.
-    const code = push(99) ++ withAddress(.store, 4) ++
-        push(11) ++ push(base) ++ [_]u8{opByte(.store32)} ++
-        withAddress(.load, 4) ++ [_]u8{ opByte(.print), opByte(.halt) };
-    try std.testing.expectEqual(shape.len, code.len);
+    try harness.vm.loadProgram(&code);
+    try harness.vm.run();
 
-    const zeros: [8]u8 = @splat(0);
-    try runImage(&harness, &code, &zeros);
-    // The byte store did not change the data segment.
-    try std.testing.expectEqualStrings("99\n", harness.written());
-    try std.testing.expectEqual(@as(i32, 99), vm.data[4]);
-    try std.testing.expectEqual(@as(i32, 11), vm.readMemory(i32, @intCast(base)));
-    // And the data segment is not memory: slot 4 is not byte 4.
-    try std.testing.expectEqual(@as(u8, opByte(.push)), vm.memory[0]);
+    // The operand form wrote it and the byte form read it. Then the reverse.
+    try std.testing.expectEqualStrings("99\n77\n", harness.written());
+    try std.testing.expectEqual(@as(i32, 77), vm.readMemory(i32, global));
 }
 
-test "the operand form and the stack form reach the same data cell" {
-    // `store 7` and `push 7` with `store_at` must name one cell. This is the
-    // invariant that lets a program calculate an address, and it is the invariant
-    // that changes shape when the data segment becomes byte-addressed.
+test "the operand form and the stack form reach the same bytes" {
+    // `store 400` and `push 400` with `store_at` must name one place. This is the
+    // invariant that lets a program calculate an address.
     var harness = Harness.init();
     defer harness.deinit();
     harness.start();
 
-    const program = push(11) ++ withAddress(.store, 7) ++
-        push(7) ++ [_]u8{ opByte(.load_at), opByte(.print), opByte(.pop) } ++
-        push(22) ++ push(7) ++ [_]u8{opByte(.store_at)} ++
-        withAddress(.load, 7) ++ [_]u8{ opByte(.print), opByte(.halt) };
+    const program = push(11) ++ withAddress(.store, 400) ++
+        push(400) ++ [_]u8{ opByte(.load_at), opByte(.print), opByte(.pop) } ++
+        push(22) ++ push(400) ++ [_]u8{opByte(.store_at)} ++
+        withAddress(.load, 400) ++ [_]u8{ opByte(.print), opByte(.halt) };
 
     try harness.vm.loadProgram(&program);
     try harness.vm.run();
 
     try std.testing.expectEqualStrings("11\n22\n", harness.written());
-    try std.testing.expectEqual(@as(i32, 22), harness.vm.data[7]);
+    try std.testing.expectEqual(@as(i32, 22), harness.vm.readMemory(i32, 400));
 }
