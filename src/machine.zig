@@ -617,6 +617,55 @@ pub const VM = struct {
                     self.sp -= 1;
                     self.stack[self.sp - 1] = @bitCast(std.math.rotl(u32, value, count));
                 },
+
+                // Floating point. A slot holds the bits of a binary32, so each of
+                // these reads the same four bytes as a different type.
+                //
+                // None of the arithmetic traps. IEEE-754 gives every operation an
+                // answer, so a division by zero is an infinity here rather than the
+                // fault that `div` reports.
+                .fadd => try self.floatBinary(add),
+                .fsub => try self.floatBinary(sub),
+                .fmul => try self.floatBinary(mul),
+                .fdiv => try self.floatBinary(div),
+                .fneg => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    self.stack[self.sp - 1] = toSlot(-fromSlot(self.stack[self.sp - 1]));
+                },
+                .fsqrt => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    self.stack[self.sp - 1] = toSlot(@sqrt(fromSlot(self.stack[self.sp - 1])));
+                },
+
+                // Each comparison leaves an integer 0 or 1, as its integer twin
+                // does, so a `jmp_not_zero` reads it the same way. A NaN answers
+                // false to all of them but `fne`.
+                .feq => try self.floatComparison(eq),
+                .fne => try self.floatComparison(ne),
+                .flt => try self.floatComparison(lt),
+                .fle => try self.floatComparison(lte),
+                .fgt => try self.floatComparison(gt),
+                .fge => try self.floatComparison(gte),
+
+                .f2i => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    const value = try floatToInt(i32, fromSlot(self.stack[self.sp - 1]));
+                    self.stack[self.sp - 1] = value;
+                },
+                .f2u => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    const value = try floatToInt(u32, fromSlot(self.stack[self.sp - 1]));
+                    self.stack[self.sp - 1] = @bitCast(value);
+                },
+                .i2f => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    self.stack[self.sp - 1] = toSlot(@floatFromInt(self.stack[self.sp - 1]));
+                },
+                .u2f => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    const bits: u32 = @bitCast(self.stack[self.sp - 1]);
+                    self.stack[self.sp - 1] = toSlot(@floatFromInt(bits));
+                },
                 // The wrapping arithmetic. Each one gives the low 32 bits of the
                 // result and never traps, which is what unsigned arithmetic in C is
                 // defined to do.
@@ -1013,6 +1062,41 @@ pub const VM = struct {
         };
     }
 
+    // Floating point ----------------------------------------------------------
+    //
+    // A slot is four bytes and a binary32 is four bytes, so a float lives on the
+    // operand stack with no room to spare and no tag. These two are the whole of
+    // the representation: the bits go in and come out unchanged.
+
+    fn fromSlot(slot: i32) f32 {
+        return @bitCast(slot);
+    }
+
+    fn toSlot(value: f32) i32 {
+        return @bitCast(value);
+    }
+
+    /// Apply a two-operand floating-point instruction. None of them can fail:
+    /// IEEE-754 answers every one, so there is no error to give.
+    fn floatBinary(self: *VM, comptime apply: fn (f32, f32) f32) !void {
+        if (self.sp < 2) return error.StackUnderflow;
+
+        const a = fromSlot(self.stack[self.sp - 2]);
+        const b = fromSlot(self.stack[self.sp - 1]);
+        self.sp -= 1;
+        self.stack[self.sp - 1] = toSlot(apply(a, b));
+    }
+
+    /// The same for a comparison, which leaves the integer 1 or 0.
+    fn floatComparison(self: *VM, comptime compare: fn (f32, f32) bool) !void {
+        if (self.sp < 2) return error.StackUnderflow;
+
+        const a = fromSlot(self.stack[self.sp - 2]);
+        const b = fromSlot(self.stack[self.sp - 1]);
+        self.sp -= 1;
+        self.stack[self.sp - 1] = if (compare(a, b)) 1 else 0;
+    }
+
     /// Take the target of an indirect transfer off the stack, check it, and give
     /// the offset to continue at.
     ///
@@ -1141,6 +1225,69 @@ pub const VM = struct {
         return bytes[0..terminator];
     }
 };
+
+/// The floating-point operations, as functions so that one instruction body can
+/// take any of them. Zig's operators already follow IEEE-754: a NaN compares
+/// false against everything, and a division by zero gives an infinity.
+fn add(a: f32, b: f32) f32 {
+    return a + b;
+}
+
+fn sub(a: f32, b: f32) f32 {
+    return a - b;
+}
+
+fn mul(a: f32, b: f32) f32 {
+    return a * b;
+}
+
+fn div(a: f32, b: f32) f32 {
+    return a / b;
+}
+
+fn eq(a: f32, b: f32) bool {
+    return a == b;
+}
+
+fn ne(a: f32, b: f32) bool {
+    return a != b;
+}
+
+fn lt(a: f32, b: f32) bool {
+    return a < b;
+}
+
+fn lte(a: f32, b: f32) bool {
+    return a <= b;
+}
+
+fn gt(a: f32, b: f32) bool {
+    return a > b;
+}
+
+fn gte(a: f32, b: f32) bool {
+    return a >= b;
+}
+
+/// Truncate `value` toward zero into `T`, as a cast in C does.
+///
+/// A value the integer cannot hold has no answer, so this gives an error rather
+/// than a number: C leaves the case undefined, and the rest of this VM reports
+/// an arithmetic result it cannot represent instead of inventing one.
+///
+/// The bound is written as one condition that must hold, so a NaN fails it
+/// without a test of its own: every comparison against a NaN is false.
+fn floatToInt(comptime T: type, value: f32) !T {
+    const truncated = @trunc(value);
+    // The first magnitude the type cannot reach, which is a power of two and so
+    // exactly representable. Comparing against the largest value it *can* reach
+    // would not be: 2147483647 has no binary32 form and rounds up to the limit.
+    const limit: f32 = @floatFromInt(@as(i64, std.math.maxInt(T)) + 1);
+    const floor: f32 = if (std.math.minInt(T) == 0) 0.0 else -limit;
+
+    if (!(truncated >= floor and truncated < limit)) return error.InvalidFloatConversion;
+    return @intFromFloat(truncated);
+}
 
 // Test harness ---------------------------------------------------------------
 
@@ -2909,4 +3056,195 @@ test "an indirect jump refuses a target that is not an instruction" {
     );
     // The target comes off the stack, so an empty stack has none to give.
     try expectTrap(&[_]u8{ opByte(.jmp_indirect), opByte(.halt) }, error.StackUnderflow, "");
+}
+
+// Floating point ---------------------------------------------------------------
+
+/// Encode `push` of the bits of a float, which is how a program names one: the
+/// assembler has no float literal and the compiler emits the bit pattern.
+fn pushFloat(value: f32) [5]u8 {
+    return push(@bitCast(value));
+}
+
+/// Run one instruction on two floats and give back what it left.
+fn floatResult(code: bytecode.OpCode, a: f32, b: f32) !f32 {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    var program: [12]u8 = undefined;
+    program[0..5].* = pushFloat(a);
+    program[5..10].* = pushFloat(b);
+    program[10] = opByte(code);
+    program[11] = opByte(.halt);
+
+    try harness.vm.loadProgram(&program);
+    try harness.vm.run();
+    try std.testing.expectEqual(@as(usize, 1), harness.vm.sp);
+    return @bitCast(harness.vm.stack[0]);
+}
+
+/// The bits of a float, as a program names one.
+fn fbits(value: f32) i32 {
+    return @bitCast(value);
+}
+
+/// The same for an instruction that takes one operand. The operand is the raw
+/// slot: some of these read it as a float and some as an integer.
+fn floatUnary(code: bytecode.OpCode, slot: i32) !i32 {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    var program: [7]u8 = undefined;
+    program[0..5].* = push(slot);
+    program[5] = opByte(code);
+    program[6] = opByte(.halt);
+
+    try harness.vm.loadProgram(&program);
+    try harness.vm.run();
+    try std.testing.expectEqual(@as(usize, 1), harness.vm.sp);
+    return harness.vm.stack[0];
+}
+
+test "the floating-point arithmetic is the arithmetic of binary32" {
+    const expect = std.testing.expectEqual;
+
+    try expect(@as(f32, 3.5), try floatResult(.fadd, 1.25, 2.25));
+    try expect(@as(f32, -1.0), try floatResult(.fsub, 1.25, 2.25));
+    try expect(@as(f32, 2.8125), try floatResult(.fmul, 1.25, 2.25));
+    try expect(@as(f32, 2.5), try floatResult(.fdiv, 5.0, 2.0));
+
+    // A slot is 32 bits, so the arithmetic is 32 bits: adding one to sixteen
+    // million and a bit changes nothing, where a double would keep it.
+    try expect(@as(f32, 16777216.0), try floatResult(.fadd, 16777216.0, 1.0));
+
+    try expect(@as(i32, @bitCast(@as(f32, -2.5))), try floatUnary(.fneg, fbits(2.5)));
+    try expect(@as(i32, @bitCast(@as(f32, 3.0))), try floatUnary(.fsqrt, fbits(9.0)));
+
+    // Negating a zero gives the other zero, which is a different bit pattern and
+    // still compares equal to it.
+    try expect(@as(i32, @bitCast(@as(f32, -0.0))), try floatUnary(.fneg, fbits(0.0)));
+}
+
+test "floating-point arithmetic answers where integer arithmetic traps" {
+    // `div` traps on a zero divisor and `add` traps on overflow. IEEE-754 has an
+    // answer for both, so these do not trap: that is the one place where the
+    // floating-point instructions part company with the integer ones.
+    const inf = std.math.inf(f32);
+
+    try std.testing.expectEqual(inf, try floatResult(.fdiv, 1.0, 0.0));
+    try std.testing.expectEqual(-inf, try floatResult(.fdiv, -1.0, 0.0));
+    try std.testing.expect(std.math.isNan(try floatResult(.fdiv, 0.0, 0.0)));
+
+    // An overflow gives an infinity rather than the trap that `mul` would.
+    try std.testing.expectEqual(inf, try floatResult(.fmul, 3.0e38, 3.0e38));
+    // And an underflow gives a zero.
+    try std.testing.expectEqual(@as(f32, 0.0), try floatResult(.fmul, 1.0e-30, 1.0e-30));
+
+    // The square root of a negative number is a NaN, not a fault.
+    try std.testing.expect(std.math.isNan(@as(f32, @bitCast(try floatUnary(.fsqrt, fbits(-1.0))))));
+}
+
+test "a NaN compares false against everything, itself included" {
+    const nan = std.math.nan(f32);
+
+    for ([_]bytecode.OpCode{ .feq, .flt, .fle, .fgt, .fge }) |code| {
+        try std.testing.expectEqual(@as(f32, 0.0), try floatResult(code, nan, nan));
+        try std.testing.expectEqual(@as(f32, 0.0), try floatResult(code, nan, 1.0));
+        try std.testing.expectEqual(@as(f32, 0.0), try floatResult(code, 1.0, nan));
+    }
+    // `fne` is the one that is true for a NaN, which is what C requires of `!=`.
+    try std.testing.expectEqual(@as(i32, 1), @as(i32, @bitCast(try floatResult(.fne, nan, nan))));
+}
+
+test "the floating-point comparisons leave the integers a branch reads" {
+    // Each pushes 1 or 0, exactly as `lt` and the rest do, so `jmp_not_zero`
+    // reads the answer without knowing which kind of comparison made it.
+    const cases = [_]struct { code: bytecode.OpCode, a: f32, b: f32, want: i32 }{
+        .{ .code = .feq, .a = 1.5, .b = 1.5, .want = 1 },
+        .{ .code = .feq, .a = 1.5, .b = 2.5, .want = 0 },
+        .{ .code = .fne, .a = 1.5, .b = 2.5, .want = 1 },
+        .{ .code = .flt, .a = 1.5, .b = 2.5, .want = 1 },
+        .{ .code = .flt, .a = 2.5, .b = 1.5, .want = 0 },
+        .{ .code = .fle, .a = 1.5, .b = 1.5, .want = 1 },
+        .{ .code = .fgt, .a = 2.5, .b = 1.5, .want = 1 },
+        .{ .code = .fge, .a = 1.5, .b = 1.5, .want = 1 },
+        // A negative zero equals a positive one, though their bits differ.
+        .{ .code = .feq, .a = 0.0, .b = -0.0, .want = 1 },
+    };
+
+    for (cases) |case| {
+        const bits: i32 = @bitCast(try floatResult(case.code, case.a, case.b));
+        try std.testing.expectEqual(case.want, bits);
+    }
+}
+
+test "converting to an integer truncates toward zero" {
+    const expect = std.testing.expectEqual;
+
+    try expect(@as(i32, 2), try floatUnary(.f2i, fbits(2.9)));
+    try expect(@as(i32, -2), try floatUnary(.f2i, fbits(-2.9)));
+    try expect(@as(i32, 0), try floatUnary(.f2i, fbits(0.9)));
+    try expect(@as(i32, 0), try floatUnary(.f2i, fbits(-0.9)));
+
+    // The ends of the range are reachable, as far as the format reaches them.
+    // 2147483520 is the largest binary32 below two to the thirty-first, and it
+    // converts to itself; the largest `i32` has no float form at all, because 24
+    // bits of significand cannot name it.
+    try expect(@as(i32, 2147483520), try floatUnary(.f2i, fbits(2147483520.0)));
+    try expect(@as(i32, std.math.minInt(i32)), try floatUnary(.f2i, fbits(-2147483648.0)));
+
+    // Unsigned takes the whole positive range, and a value between minus one and
+    // zero truncates to a zero it can hold.
+    try expect(@as(i32, @bitCast(@as(u32, 4000000000))), try floatUnary(.f2u, fbits(4.0e9)));
+    try expect(@as(i32, 0), try floatUnary(.f2u, fbits(-0.5)));
+}
+
+test "a float that no integer can hold is refused rather than guessed at" {
+    // C leaves this undefined. The rest of the VM reports a result it cannot
+    // represent instead of inventing one, and so does this.
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+
+    for ([_]f32{ 2147483648.0, -2147483904.0, 1.0e30, nan, inf, -inf }) |value| {
+        var program: [7]u8 = undefined;
+        program[0..5].* = pushFloat(value);
+        program[5] = opByte(.f2i);
+        program[6] = opByte(.halt);
+        try expectTrap(&program, error.InvalidFloatConversion, "");
+    }
+
+    // Unsigned refuses a negative that truncates below zero, and the same ends.
+    for ([_]f32{ -1.0, 4294967296.0, nan, inf }) |value| {
+        var program: [7]u8 = undefined;
+        program[0..5].* = pushFloat(value);
+        program[5] = opByte(.f2u);
+        program[6] = opByte(.halt);
+        try expectTrap(&program, error.InvalidFloatConversion, "");
+    }
+}
+
+test "converting from an integer rounds to the nearest float" {
+    const expect = std.testing.expectEqual;
+
+    try expect(@as(i32, @bitCast(@as(f32, 42.0))), try floatUnary(.i2f, 42));
+    try expect(@as(i32, @bitCast(@as(f32, -42.0))), try floatUnary(.i2f, -42));
+
+    // Twenty-four bits of significand cannot keep every integer, so a large one
+    // rounds. This is a property of the format and not a fault.
+    try expect(@as(i32, @bitCast(@as(f32, 16777216.0))), try floatUnary(.i2f, 16777217));
+
+    // The same bits read as unsigned are a different number.
+    try expect(@as(i32, @bitCast(@as(f32, -1.0))), try floatUnary(.i2f, -1));
+    try expect(@as(i32, @bitCast(@as(f32, 4294967296.0))), try floatUnary(.u2f, -1));
+}
+
+test "a float instruction with too little on the stack is refused" {
+    for ([_]bytecode.OpCode{ .fadd, .fsub, .fmul, .fdiv, .feq, .flt }) |code| {
+        try expectTrap(&[_]u8{ opByte(code), opByte(.halt) }, error.StackUnderflow, "");
+    }
+    for ([_]bytecode.OpCode{ .fneg, .fsqrt, .f2i, .f2u, .i2f, .u2f }) |code| {
+        try expectTrap(&[_]u8{ opByte(code), opByte(.halt) }, error.StackUnderflow, "");
+    }
 }
