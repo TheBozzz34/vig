@@ -499,22 +499,7 @@ pub const VM = struct {
                     self.ip = target;
                 },
                 .call_indirect => {
-                    if (self.sp == 0) return error.StackUnderflow;
-
-                    self.sp -= 1;
-                    const value = self.stack[self.sp];
-                    // The target is an address in the code region, so it is a
-                    // positive number below the end of that region. A negative one
-                    // has no unsigned equivalent, exactly as for a data address.
-                    if (value < 0) return error.SegmentFault;
-                    const target: u32 = @intCast(value);
-                    if (target >= self.code_len) return error.SegmentFault;
-
-                    // A direct call has a verified target, because the verifier read
-                    // the operand before the run. This target was on the stack, so no
-                    // read of the code could find it. Therefore the check happens
-                    // here, the first time a call goes to this address.
-                    try self.verifyCallTarget(target);
+                    const target = try self.indirectTarget();
 
                     if (self.csp >= self.call_stack.len) return error.CallStackOverflow;
 
@@ -528,6 +513,9 @@ pub const VM = struct {
                     self.csp += 1;
                     self.ip = target;
                 },
+                // The same target, without a frame to come back to: control leaves
+                // and does not return. This is what a jump table needs.
+                .jmp_indirect => self.ip = try self.indirectTarget(),
                 .enter => {
                     const shape = try utils.readFrameShape(self);
                     try self.enterFrame(shape);
@@ -1025,14 +1013,40 @@ pub const VM = struct {
         };
     }
 
-    /// Verify the function that an indirect call names.
+    /// Take the target of an indirect transfer off the stack, check it, and give
+    /// the offset to continue at.
+    ///
+    /// `call_indirect` and `jmp_indirect` differ in what they do afterwards and in
+    /// nothing before it, so both arrive here.
+    fn indirectTarget(self: *VM) !u32 {
+        if (self.sp == 0) return error.StackUnderflow;
+
+        self.sp -= 1;
+        const value = self.stack[self.sp];
+        // The target is an address in the code region, so it is a positive number
+        // below the end of that region. A negative one has no unsigned equivalent,
+        // exactly as for a data address.
+        if (value < 0) return error.SegmentFault;
+        const target: u32 = @intCast(value);
+        if (target >= self.code_len) return error.SegmentFault;
+
+        // A direct transfer has a verified target, because the verifier read the
+        // operand before the run. This one was on the stack, so no read of the code
+        // could find it. Therefore the check happens here, the first time control
+        // goes to this address.
+        try self.verifyIndirectTarget(target);
+        return target;
+    }
+
+    /// Verify the code that an indirect transfer names.
     ///
     /// The walk at load time starts at the entry point and follows what it reads, so
-    /// it never reaches a function that only a pointer names. This is where such a
-    /// function is checked, and the marks from load time say whether an earlier call
-    /// already checked it. The code cannot change while the program runs, so the
-    /// answer is the one that a check before the run would have given.
-    fn verifyCallTarget(self: *VM, target: u32) !void {
+    /// it never reaches code that only a value names: the body of a function that a
+    /// pointer calls, or the arm of a jump table. This is where such code is
+    /// checked, and the marks from load time say whether an earlier transfer already
+    /// checked it. The code cannot change while the program runs, so the answer is
+    /// the one that a check before the run would have given.
+    fn verifyIndirectTarget(self: *VM, target: u32) !void {
         // The common case: an address that some path already decoded. The verifier
         // answers this from one mark, but the call is not free, and an indirect call
         // is an instruction in a loop as often as any other.
@@ -2773,4 +2787,126 @@ test "a foreign function writes into a call frame through a pointer argument" {
     const printed = std.mem.trimEnd(u8, harness.written(), "\n");
     const year = try std.fmt.parseInt(u32, printed, 10);
     try std.testing.expect(year > 2000);
+}
+
+test "an indirect jump reaches a label that no instruction names" {
+    // The arm at offset 12 is reached only through the value on the stack, so the
+    // walk at load time never sees it. It is verified when the jump goes there,
+    // exactly as a function body is for an indirect call.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    // 0: push 12   5   the address of the arm
+    // 5: jmp_indirect  1
+    // 6: push 111  5   skipped: the jump does not fall through
+    // 11: halt     1
+    // 12: push 42  5   the arm
+    // 17: halt     1
+    const program = push(12) ++ [_]u8{opByte(.jmp_indirect)} ++
+        push(111) ++ [_]u8{opByte(.halt)} ++
+        push(42) ++ [_]u8{opByte(.halt)};
+
+    try harness.vm.loadProgram(&program);
+    try std.testing.expectEqual(bytecode.verify.Mark.unknown, harness.vm.verify_scratch[12]);
+
+    try harness.vm.run();
+
+    // The arm ran and the instruction after the jump did not.
+    try std.testing.expectEqual(@as(usize, 1), harness.vm.sp);
+    try std.testing.expectEqual(@as(i32, 42), harness.vm.stack[0]);
+    try std.testing.expectEqual(bytecode.verify.Mark.boundary, harness.vm.verify_scratch[12]);
+}
+
+test "an indirect jump saves no return offset" {
+    // This is the whole difference from `call_indirect`: there is no frame to come
+    // back to, so the call stack is untouched and a `ret` afterwards has nothing to
+    // return to.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    const program = push(7) ++ [_]u8{ opByte(.jmp_indirect), opByte(.halt) } ++
+        [_]u8{opByte(.ret)};
+
+    try harness.vm.loadProgram(&program);
+    try std.testing.expectError(error.CallStackUnderflow, harness.vm.run());
+    try std.testing.expectEqual(@as(usize, 0), harness.vm.csp);
+}
+
+test "a jump table picks its arm from memory" {
+    // What the instruction exists for: one load and one jump instead of a
+    // comparison for each case. The table is three addresses in the data region,
+    // and the index chooses which arm runs.
+    for ([_]struct { index: i32, expected: i32 }{
+        .{ .index = 0, .expected = 10 },
+        .{ .index = 1, .expected = 20 },
+        .{ .index = 2, .expected = 30 },
+    }) |case| {
+        var harness = Harness.init();
+        defer harness.deinit();
+        harness.start();
+
+        // `index * 4 + table`, loaded and jumped to.  Every `push` is five bytes
+        // whatever it pushes, so the prologue has a fixed length and the arms that
+        // follow it have fixed addresses.
+        const prologue_len = 5 + 5 + 1 + 5 + 1 + 1 + 1;
+        const arm_len = 5 + 1; // push, halt
+        const table = prologue_len + 3 * arm_len; // the data region starts here
+        const arms = [_]u32{
+            prologue_len,
+            prologue_len + arm_len,
+            prologue_len + 2 * arm_len,
+        };
+        const code = push(case.index) ++ push(4) ++ [_]u8{opByte(.mul)} ++
+            push(table) ++ [_]u8{ opByte(.add), opByte(.load32), opByte(.jmp_indirect) };
+        try std.testing.expectEqual(@as(usize, prologue_len), code.len);
+
+        var program: std.ArrayList(u8) = .empty;
+        defer program.deinit(std.testing.allocator);
+        try program.appendSlice(std.testing.allocator, &code);
+        // The three arms, each a push and a halt.
+        for ([_]i32{ 10, 20, 30 }) |value| {
+            try program.appendSlice(std.testing.allocator, &push(value));
+            try program.append(std.testing.allocator, opByte(.halt));
+        }
+
+        var data: [12]u8 = undefined;
+        for (arms, 0..) |arm, i| std.mem.writeInt(u32, data[i * 4 ..][0..4], arm, .little);
+
+        const container_bytes = try buildContainer(.{
+            .code = program.items,
+            .data = &data,
+        });
+        defer std.testing.allocator.free(container_bytes);
+
+        try harness.vm.loadProgram(container_bytes);
+        try harness.vm.run();
+        try std.testing.expectEqual(case.expected, harness.vm.stack[0]);
+    }
+}
+
+test "an indirect jump refuses a target that is not an instruction" {
+    // The same checks an indirect call gets: the address must be inside the code
+    // region and must be a whole instruction there.
+    try expectContainerTrap(
+        &(push(1) ++ [_]u8{ opByte(.jmp_indirect), opByte(.halt) }),
+        error.MisalignedTarget,
+    );
+    try expectContainerTrap(
+        &(push(7) ++ [_]u8{ opByte(.jmp_indirect), opByte(.halt), 0xfe }),
+        error.UnknownOpcode,
+    );
+    try expectTrap(
+        &(push(-1) ++ [_]u8{ opByte(.jmp_indirect), opByte(.halt) }),
+        error.SegmentFault,
+        "",
+    );
+    try expectTrap(
+        &(push(64) ++ [_]u8{ opByte(.jmp_indirect), opByte(.halt) }),
+        error.SegmentFault,
+        "",
+    );
+    // The target comes off the stack, so an empty stack has none to give.
+    try expectTrap(&[_]u8{ opByte(.jmp_indirect), opByte(.halt) }, error.StackUnderflow, "");
 }

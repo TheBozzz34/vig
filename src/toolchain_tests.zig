@@ -835,3 +835,57 @@ test "the assembler and the VM divide the address checks between them" {
     const last = std.fmt.comptimePrint("push 5\nstore {d}\nhalt", .{constants.testing.memory_size - 4});
     try expectSourceOutput(last, "");
 }
+
+test "a switch compiles to a jump table" {
+    // What `jmp_indirect` exists for. The table holds the address of each arm and
+    // the index picks one, so a `switch` over a dense range costs one load and one
+    // jump rather than a comparison for every case.
+    //
+    // Only the table names the arms, so the walk at load time reaches none of them.
+    // Each is verified the first time the jump goes there.
+    const source =
+        \\entry _start
+        \\_start:
+        \\  call main
+        \\  halt
+        \\main:
+        \\  enter 0 1
+        \\  push 0
+        \\  store_local 0
+        \\loop:
+        \\  load_local 0
+        \\  push 4
+        \\  mul
+        \\  push table
+        \\  add
+        \\  load32
+        \\  jmp_indirect
+        \\case_zero:
+        \\  push 100
+        \\  jmp show
+        \\case_one:
+        \\  push 200
+        \\  jmp show
+        \\case_two:
+        \\  push 300
+        \\  jmp show
+        \\case_three:
+        \\  push 400
+        \\show:
+        \\  print
+        \\  pop
+        \\  load_local 0
+        \\  push 1
+        \\  add
+        \\  store_local 0
+        \\  load_local 0
+        \\  push 4
+        \\  lt
+        \\  jmp_not_zero loop
+        \\  ret
+        \\table:
+        \\  i32 case_zero, case_one, case_two, case_three
+    ;
+
+    try expectSourceOutput(source, "100\n200\n300\n400\n");
+}
