@@ -5,6 +5,11 @@ const std = @import("std");
 
 const Io = std.Io;
 
+/// The largest program file that a tool here reads. A container holds the header and
+/// the import table as well as the image, so the file can be larger than the memory
+/// of the VM.
+pub const max_program_file_size = constants.max_program_file_size;
+
 pub fn loadProgramFromFile(vm: *machine.VM, io: Io, allocator: std.mem.Allocator, path: []const u8) !void {
     // The VM removes the container header and the import table before the code
     // goes into VM memory. Permit the largest correct container and a full memory

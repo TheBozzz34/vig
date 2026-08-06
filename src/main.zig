@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const bytecode = @import("vig_bytecode");
 const Io = std.Io;
 const machine = @import("machine.zig");
 const utils = @import("utils.zig");
@@ -31,9 +32,21 @@ pub fn main(init: std.process.Init) !void {
     defer vm.deinit();
     std.log.info("VM initialized successfully.", .{});
 
-    if (args.len > 2) {
-        std.log.err("Usage: vig [program-file]", .{});
+    // `--disasm` writes the program as a listing and runs nothing. A person reading
+    // the output of a compiler needs to see the instructions that came out, and a
+    // trap that names a code offset needs a listing to be worth anything.
+    const disassemble = args.len == 3 and
+        (std.mem.eql(u8, args[1], "--disasm") or std.mem.eql(u8, args[1], "-d"));
+
+    if (args.len > 2 and !disassemble) {
+        std.log.err("Usage: vig [--disasm] [program-file]", .{});
         return error.InvalidArguments;
+    }
+
+    if (disassemble) {
+        try disassembleFile(init.io, arena, args[2], &stdout.interface);
+        try stdout.interface.flush();
+        return;
     }
 
     if (args.len == 2) {
@@ -99,4 +112,30 @@ pub fn main(init: std.process.Init) !void {
 
     std.log.info("============= END OF OUTPUT =============", .{});
     std.log.info("VM execution completed successfully.", .{});
+}
+
+/// Write the program in `path` as a listing.
+///
+/// The import names come from the container, so a `foreign_call` names its import as
+/// the source did. The VM does not load the program: a listing of a program that the
+/// verifier refuses is exactly what a person needs to see.
+fn disassembleFile(
+    io: Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    writer: *Io.Writer,
+) !void {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(utils.max_program_file_size + 1),
+    );
+    const image = try bytecode.container.parse(bytes);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    var imports = image.importIterator();
+    while (try imports.next()) |import| try names.append(allocator, import.symbol);
+
+    try bytecode.disasm.writeImage(writer, image, .{ .import_names = names.items });
 }
