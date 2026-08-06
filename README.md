@@ -24,6 +24,32 @@ decode, every branch must land on an instruction boundary, and control must not
 fall off the end of the code. A rejected program reports the code offset that
 failed and does not execute at all.
 
+A function that only a `call_indirect` names is not reachable from the entry point,
+so the walk at load time does not find it. Such a function is verified the first
+time a call goes to it, and the result is kept. The code region cannot change while
+a program runs, so the answer is the one a check before the run would have given.
+
+## Reading a program
+
+`vig --disasm program.vig` writes the program as a listing instead of running it:
+the offset, the bytes and the instruction on each line, then the static data. A
+trap names a code offset, and this is how that offset becomes an instruction.
+
+```
+$ vig --disasm table.vig
+; 44 bytes of code, 11 of static data, 0 zero-filled
+        ; entry point
+0000  01 15 00 00 00  push 21
+0005  01 30 00 00 00  push 48
+000a  2c              load32
+000b  3e              call_indirect
+000c  04              print
+000d  00              halt
+```
+
+The program does not have to load: a listing of a program the verifier refuses is
+exactly what a person needs to see.
+
 ## Runtime I/O
 
 `print` and `print_string` write to **stdout**. The VM's own diagnostics go to **stderr**, so program output can
