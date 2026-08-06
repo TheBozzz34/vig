@@ -751,14 +751,16 @@ pub const VM = struct {
     // take the address of a global and use it, and that is what makes a pointer, an
     // array and a structure possible.
 
-    // The first address that a guest pointer cannot use. A pointer names a byte of
-    // the program image: the code, then the static data, then the zero-filled
-    // region. A program can therefore build a string in that region and print it.
+    // The first address that a guest *string* cannot use.
     //
-    // The limit is the image and not the whole of memory. Memory above the image
-    // starts as zeros, so every address in it would look like the end of a string,
+    // A string is read to its terminator, so the search needs somewhere to stop. The
+    // limit is the program image — the code, then the static data, then the
+    // zero-filled region — and not the whole of memory, because memory above the
+    // image starts as zeros: every address in it would look like the end of a string
     // and `UnterminatedGuestString` would stop meaning anything.
-    fn guestPointerLimit(self: *const VM) usize {
+    //
+    // A pointer that is not a string has no such limit. See `guestPointer`.
+    fn guestStringLimit(self: *const VM) usize {
         return self.program_len;
     }
 
@@ -1093,11 +1095,23 @@ pub const VM = struct {
     // A guest pointer is an offset into the complete program image. That image
     // includes the code and the static data. Therefore a program can give a
     // string that it declared with `asciiz`.
+    /// The host address for a guest pointer that a foreign function will receive.
+    ///
+    /// A `ptr` argument may name any byte of guest memory, including one in a call
+    /// frame. That is what lets a C program pass the address of a local, which is
+    /// most of what a pointer argument is for. The bound is the memory itself, so a
+    /// foreign function still cannot be handed an address outside it.
+    ///
+    /// A `cstr` argument is read to its terminator, so it keeps the tighter bound of
+    /// `guestStringLimit`. A zero value is the null pointer either way.
     fn guestPointer(self: *VM, value: i32, require_terminator: bool) !usize {
         if (value == 0) return 0;
         if (value < 0) return error.InvalidGuestPointer;
+
         const offset: usize = @intCast(value);
-        if (offset >= self.guestPointerLimit()) return error.InvalidGuestPointer;
+        const limit = if (require_terminator) self.guestStringLimit() else self.memory.len;
+        if (offset >= limit) return error.InvalidGuestPointer;
+
         if (require_terminator) _ = try self.guestCString(value);
         return @intFromPtr(self.memory[offset..].ptr);
     }
@@ -1105,7 +1119,7 @@ pub const VM = struct {
     fn guestCString(self: *VM, value: i32) ![]const u8 {
         if (value <= 0) return error.InvalidGuestPointer;
         const offset: usize = @intCast(value);
-        const limit = self.guestPointerLimit();
+        const limit = self.guestStringLimit();
         if (offset >= limit) return error.InvalidGuestPointer;
 
         const bytes = self.memory[offset..limit];
@@ -2680,4 +2694,83 @@ test "a mark from one program does not answer for the next" {
     for (vm.verify_scratch[1..]) |mark| {
         try std.testing.expectEqual(bytecode.verify.Mark.unknown, mark);
     }
+}
+
+test "a pointer argument may name any byte of memory and a string may not" {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    const vm = harness.vm;
+
+    // A program with a one-byte image. Everything above `program_len` is memory that
+    // a frame takes its storage from, and that is where a local lives.
+    try vm.loadProgram(&[_]u8{opByte(.halt)});
+    const above_image: i32 = @intCast(vm.program_len + 16);
+
+    // A `ptr` argument reaches it. Passing the address of a local is most of what a
+    // pointer argument is for, and a frame is the only place a local can be.
+    _ = try vm.guestPointer(above_image, false);
+
+    // A `cstr` argument does not. A string is read to its terminator, and memory
+    // above the image is zeros, so every address in it would look like the end of a
+    // string and an unterminated one would stop being an error.
+    try std.testing.expectError(
+        error.InvalidGuestPointer,
+        vm.guestPointer(above_image, true),
+    );
+
+    // Neither kind reaches past the memory itself, and a negative address has no
+    // unsigned equivalent.
+    try std.testing.expectError(
+        error.InvalidGuestPointer,
+        vm.guestPointer(@intCast(vm.memory.len), false),
+    );
+    try std.testing.expectError(error.InvalidGuestPointer, vm.guestPointer(-1, false));
+
+    // The last byte of memory is inside it.
+    _ = try vm.guestPointer(@intCast(vm.memory.len - 1), false);
+
+    // Zero is the null pointer for both kinds, and not an address at all.
+    try std.testing.expectEqual(@as(usize, 0), try vm.guestPointer(0, false));
+    try std.testing.expectEqual(@as(usize, 0), try vm.guestPointer(0, true));
+}
+
+test "a foreign function writes into a call frame through a pointer argument" {
+    // The end-to-end form of the test above: a native function is given the address
+    // of a local and writes to it. This is what a C program does with `&x`, and it
+    // proves that the address a `ptr` argument becomes really is the frame.
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    const vm = harness.vm;
+
+    // `GetSystemTime` fills a SYSTEMTIME: eight 16-bit fields, and the first is the
+    // year. Four frame slots hold the sixteen bytes.
+    var import: bytecode.foreign.Import = .{
+        .library = "kernel32.dll",
+        .symbol = "GetSystemTime",
+    };
+    try import.addArg(.ptr);
+
+    const main_offset = 6;
+    const code = withAddress(.call, main_offset) ++ [_]u8{opByte(.halt)} ++
+        enterFrame(0, 4) ++
+        withLocal(.local_addr, 0) ++
+        [_]u8{ opByte(.foreign_call), 0, opByte(.pop) } ++
+        withLocal(.local_addr, 0) ++
+        [_]u8{ opByte(.load16_u), opByte(.print), opByte(.pop), opByte(.ret) };
+
+    const program = try buildContainer(.{ .imports = &.{import}, .code = &code });
+    defer std.testing.allocator.free(program);
+
+    try vm.loadProgram(program);
+    try vm.run();
+
+    // The year that Windows wrote into the frame. Any year past 2000 says that the
+    // native function reached the right bytes; a wrong address would give zero.
+    const printed = std.mem.trimEnd(u8, harness.written(), "\n");
+    const year = try std.fmt.parseInt(u32, printed, 10);
+    try std.testing.expect(year > 2000);
 }

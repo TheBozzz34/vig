@@ -65,14 +65,25 @@ The current foreign-call ABI is intentionally small:
 - Integer and pointer calls only, in the default convention of the target. See
   Platform support above.
 
-`ptr` and `cstr` values are offsets into the loaded VIG program image — the code
-region followed by the static-data region — not native addresses. A zero pointer
-is passed as `NULL`. `cstr` must point to a NUL-terminated string inside that
-image, which is what `asciiz` produces. This permits static strings without
-exposing arbitrary host-memory pointers.
+`ptr` and `cstr` values are byte addresses in guest memory, not native addresses.
+The VM translates one into a host address for the call, so a foreign function never
+sees a VIG address and a VIG program never sees a host one. A zero value is passed
+as `NULL`.
+
+The two differ in what they may name:
+
+- **`ptr` may name any byte of guest memory**, including one in a call frame.
+  Therefore a program can pass the address of a local, and a foreign function can
+  write into it — which is what an output parameter is. The bound is the memory
+  itself, so no address outside it can be handed to a native function.
+- **`cstr` must name a byte of the program image** — the code, the static data, then
+  the zero-filled region — and the string must have its terminator inside that image.
+  A string is read to its terminator, and memory above the image starts as zeros, so
+  every address there would look like the end of a string and an unterminated one
+  would stop being an error. `asciiz` and `reserve` both produce addresses that
+  qualify.
 
 Calls that use callbacks, structs, floating-point values, more than four
-arguments, 64-bit results, or pointer output buffers are deliberately outside
-this first version.
+arguments, or 64-bit results are deliberately outside this first version.
 
 See the VIGasm opcode reference for syntax and examples.
