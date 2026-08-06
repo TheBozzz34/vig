@@ -95,6 +95,30 @@ pub const comparisons = struct {
     pub fn gte(a: i32, b: i32) bool {
         return a >= b;
     }
+
+    // The unsigned forms. The stack holds an i32 and the bits are the same either
+    // way, so these read the same two values as a different type. That is the whole
+    // difference between `int` and `unsigned int` at a comparison, and it is why
+    // `eq` and `ne` need no unsigned form: equal bits are equal bits.
+    pub fn lt_u(a: i32, b: i32) bool {
+        return unsigned(a) < unsigned(b);
+    }
+
+    pub fn lte_u(a: i32, b: i32) bool {
+        return unsigned(a) <= unsigned(b);
+    }
+
+    pub fn gt_u(a: i32, b: i32) bool {
+        return unsigned(a) > unsigned(b);
+    }
+
+    pub fn gte_u(a: i32, b: i32) bool {
+        return unsigned(a) >= unsigned(b);
+    }
+
+    fn unsigned(value: i32) u32 {
+        return @bitCast(value);
+    }
 };
 
 // Read an unsigned 32-bit operand from the code region at the instruction

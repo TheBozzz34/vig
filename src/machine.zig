@@ -128,6 +128,10 @@ pub const VM = struct {
         @memset(&self.stack, 0);
         @memset(&self.memory, 0);
         @memset(&self.call_stack, empty_frame);
+        // The marks belong to the program that made them. `call_indirect` reads them
+        // while a program runs, so a mark that an earlier program left would answer
+        // for code that is no longer there.
+        @memset(&self.verify_scratch, .unknown);
 
         self.code_len = 0;
         self.program_len = 0;
@@ -331,6 +335,33 @@ pub const VM = struct {
                 .lte => try utils.binaryComparison(self, utils.comparisons.lte),
                 .gt => try utils.binaryComparison(self, utils.comparisons.gt),
                 .gte => try utils.binaryComparison(self, utils.comparisons.gte),
+                // The same six values read as unsigned. `eq` and `ne` need no such
+                // pair, because equal bits are equal whatever they mean.
+                .lt_u => try utils.binaryComparison(self, utils.comparisons.lt_u),
+                .lte_u => try utils.binaryComparison(self, utils.comparisons.lte_u),
+                .gt_u => try utils.binaryComparison(self, utils.comparisons.gt_u),
+                .gte_u => try utils.binaryComparison(self, utils.comparisons.gte_u),
+                // Unsigned division needs no overflow case. The signed form traps on
+                // the one pair that has no result, and that pair is `minInt / -1`,
+                // which unsigned values cannot express.
+                .div_u => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    const a: u32 = @bitCast(self.stack[self.sp - 2]);
+                    const b: u32 = @bitCast(self.stack[self.sp - 1]);
+                    if (b == 0) return error.DivisionByZero;
+
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = @bitCast(a / b);
+                },
+                .mod_u => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    const a: u32 = @bitCast(self.stack[self.sp - 2]);
+                    const b: u32 = @bitCast(self.stack[self.sp - 1]);
+                    if (b == 0) return error.DivisionByZero;
+
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = @bitCast(a % b);
+                },
                 .jmp => {
                     const target = try utils.readU32(self);
 
@@ -410,6 +441,36 @@ pub const VM = struct {
                     // The frame has no storage yet. An `enter` in the called
                     // function gives it some. A function that needs none never calls
                     // `enter`, and its frame stays at zero slots.
+                    self.call_stack[self.csp] = .{
+                        .return_ip = self.ip,
+                        .operand_base = self.sp,
+                        .saved_frame_pointer = self.frame_pointer,
+                    };
+                    self.csp += 1;
+                    self.ip = target;
+                },
+                .call_indirect => {
+                    if (self.sp == 0) return error.StackUnderflow;
+
+                    self.sp -= 1;
+                    const value = self.stack[self.sp];
+                    // The target is an address in the code region, so it is a
+                    // positive number below the end of that region. A negative one
+                    // has no unsigned equivalent, exactly as for a data address.
+                    if (value < 0) return error.SegmentFault;
+                    const target: u32 = @intCast(value);
+                    if (target >= self.code_len) return error.SegmentFault;
+
+                    // A direct call has a verified target, because the verifier read
+                    // the operand before the run. This target was on the stack, so no
+                    // read of the code could find it. Therefore the check happens
+                    // here, the first time a call goes to this address.
+                    try self.verifyCallTarget(target);
+
+                    if (self.csp >= self.call_stack.len) return error.CallStackOverflow;
+
+                    // The target is off the stack, so `operand_base` is the height
+                    // above the arguments, as it is for a direct call.
                     self.call_stack[self.csp] = .{
                         .return_ip = self.ip,
                         .operand_base = self.sp,
@@ -502,6 +563,16 @@ pub const VM = struct {
                     self.sp -= 1;
                     self.stack[self.sp - 1] = @bitCast(value >> count);
                 },
+                // The arithmetic shift. The value keeps its type, so `>>` fills the
+                // vacated bits with the sign bit rather than with zeros. That is the
+                // difference between this instruction and `shr_u`.
+                .shr_s => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    const value = self.stack[self.sp - 2];
+                    const count: u5 = @truncate(@as(u32, @bitCast(self.stack[self.sp - 1])));
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] = value >> count;
+                },
                 .rotl => {
                     if (self.sp < 2) return error.StackUnderflow;
                     const value: u32 = @bitCast(self.stack[self.sp - 2]);
@@ -509,10 +580,23 @@ pub const VM = struct {
                     self.sp -= 1;
                     self.stack[self.sp - 1] = @bitCast(std.math.rotl(u32, value, count));
                 },
+                // The wrapping arithmetic. Each one gives the low 32 bits of the
+                // result and never traps, which is what unsigned arithmetic in C is
+                // defined to do.
                 .add_wrap => {
                     if (self.sp < 2) return error.StackUnderflow;
                     self.sp -= 1;
                     self.stack[self.sp - 1] +%= self.stack[self.sp];
+                },
+                .sub_wrap => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] -%= self.stack[self.sp];
+                },
+                .mul_wrap => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    self.sp -= 1;
+                    self.stack[self.sp - 1] *%= self.stack[self.sp];
                 },
                 .read_i32 => {
                     // Do not consume input when there is nowhere to put the
@@ -836,6 +920,31 @@ pub const VM = struct {
         }
     }
 
+    /// The checks that the verifier makes for this program, in the form it takes
+    /// them.
+    ///
+    /// A verification during a run must ask for exactly what the verification at load
+    /// time asked for. Otherwise a program could reach through an indirect call what
+    /// a direct call to the same address was refused. Therefore both callers take
+    /// their options from here.
+    ///
+    /// `code` is the code region in guest memory rather than the slice of the
+    /// container, because the container is gone once the program is loaded. The two
+    /// hold the same bytes: the region is read-only for the whole run.
+    fn verifyOptions(code: []const u8, entry_point: u32, import_count: u8) verify.Options {
+        return .{
+            .code = code,
+            .entry_point = entry_point,
+            .import_count = import_count,
+            // The VM knows the size of its memory and the length of the code.
+            // Therefore an address in a `load` or a `store` operand, and a `store`
+            // that would write an instruction, are both found before any of the
+            // program runs.
+            .memory_size = constants.memory_size,
+            .code_len = @intCast(code.len),
+        };
+    }
+
     // Make sure that the code region is safe to execute before the VM runs any of
     // it. The vig-bytecode verifier gives the list of the checks.
     fn verifyImage(self: *VM, image: container.Image) !void {
@@ -844,17 +953,41 @@ pub const VM = struct {
         std.debug.assert(image.code.len <= self.verify_scratch.len);
 
         var failure: verify.Failure = undefined;
-        verify.verify(.{
-            .code = image.code,
-            .entry_point = image.header.entry_point,
-            .import_count = image.header.import_count,
-            // The VM knows the size of its memory and the length of the code.
-            // Therefore an address in a `load` or a `store` operand, and a `store`
-            // that would write an instruction, are both found before any of the
-            // program runs.
-            .memory_size = constants.memory_size,
-            .code_len = @intCast(image.code.len),
-        }, &self.verify_scratch, &failure) catch |err| {
+        const options = verifyOptions(
+            image.code,
+            image.header.entry_point,
+            image.header.import_count,
+        );
+        verify.verify(options, &self.verify_scratch, &failure) catch |err| {
+            self.verification_failure = failure;
+            return err;
+        };
+    }
+
+    /// Verify the function that an indirect call names.
+    ///
+    /// The walk at load time starts at the entry point and follows what it reads, so
+    /// it never reaches a function that only a pointer names. This is where such a
+    /// function is checked, and the marks from load time say whether an earlier call
+    /// already checked it. The code cannot change while the program runs, so the
+    /// answer is the one that a check before the run would have given.
+    fn verifyCallTarget(self: *VM, target: u32) !void {
+        // The common case: an address that some path already decoded. The verifier
+        // answers this from one mark, but the call is not free, and an indirect call
+        // is an instruction in a loop as often as any other.
+        if (self.verify_scratch[target] == .boundary) return;
+
+        var failure: verify.Failure = undefined;
+        const options = verifyOptions(
+            self.memory[0..self.code_len],
+            // The entry point is not read by `verifyFrom`, which starts at `target`.
+            0,
+            @intCast(self.foreign_import_count),
+        );
+        verify.verifyFrom(options, &self.verify_scratch, target, &failure) catch |err| {
+            // The failure names the instruction that the verifier refused, which is
+            // inside the function and not the address that was called. A caller that
+            // reports both tells the whole story.
             self.verification_failure = failure;
             return err;
         };
@@ -1023,6 +1156,47 @@ fn push(value: i32) [5]u8 {
     bytes[0] = opByte(.push);
     std.mem.writeInt(i32, bytes[1..5], value, .little);
     return bytes;
+}
+
+// Run one binary instruction on two values and give the value it leaves. The
+// operands are runtime values, so the program is built rather than concatenated.
+fn binaryResult(code: bytecode.OpCode, a: i32, b: i32) !i32 {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    var program: [12]u8 = undefined;
+    program[0..5].* = push(a);
+    program[5..10].* = push(b);
+    program[10] = opByte(code);
+    program[11] = opByte(.halt);
+
+    try harness.vm.loadProgram(&program);
+    try harness.vm.run();
+
+    try std.testing.expectEqual(@as(usize, 1), harness.vm.sp);
+    return harness.vm.stack[0];
+}
+
+fn expectBinaryTrap(code: bytecode.OpCode, a: i32, b: i32, expected_error: anyerror) !void {
+    try std.testing.expectError(expected_error, binaryResult(code, a, b));
+}
+
+// Load `code` as a container and run it. The program must trap.
+//
+// A container is verified when it loads and bare code is not, so a test that depends
+// on the marks of the verifier must give the code this form. That is also the form
+// the assembler produces.
+fn expectContainerTrap(code: []const u8, expected_error: anyerror) !void {
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    const program = try buildContainer(.{ .code = code });
+    defer std.testing.allocator.free(program);
+
+    try harness.vm.loadProgram(program);
+    try std.testing.expectError(expected_error, harness.vm.run());
 }
 
 // Encode an instruction that has a 4-byte address operand or target operand.
@@ -1502,6 +1676,193 @@ test "traps report the failure and keep output printed before it" {
     // The VM gives an error for an opcode byte that has no instruction. It does
     // not go past the byte.
     try expectTrap(&[_]u8{0xfe}, error.InvalidInstruction, "");
+}
+
+test "the unsigned comparisons order the same bits differently" {
+    // -1 is the largest value there is as unsigned and the smallest but one as
+    // signed. Therefore this pair separates each instruction from its signed twin,
+    // and a mistake that swapped them cannot pass.
+    const expect = std.testing.expectEqual;
+
+    try expect(@as(i32, 1), try binaryResult(.lt, -1, 1));
+    try expect(@as(i32, 0), try binaryResult(.lt_u, -1, 1));
+    try expect(@as(i32, 1), try binaryResult(.lt_u, 1, -1));
+
+    try expect(@as(i32, 0), try binaryResult(.gt, -1, 1));
+    try expect(@as(i32, 1), try binaryResult(.gt_u, -1, 1));
+
+    // The forms that take equality must take it, and only it, at the boundary.
+    try expect(@as(i32, 1), try binaryResult(.lte_u, -1, -1));
+    try expect(@as(i32, 0), try binaryResult(.lt_u, -1, -1));
+    try expect(@as(i32, 1), try binaryResult(.gte_u, -1, -1));
+    try expect(@as(i32, 0), try binaryResult(.gt_u, -1, -1));
+
+    // Zero is the smallest unsigned value, so nothing is below it.
+    try expect(@as(i32, 0), try binaryResult(.lt_u, 0, 0));
+    try expect(@as(i32, 1), try binaryResult(.gte_u, 0, 0));
+    try expect(@as(i32, 0), try binaryResult(.lt_u, -1, 0));
+}
+
+test "unsigned division reads the same bits as unsigned values" {
+    const expect = std.testing.expectEqual;
+
+    // -1 is 0xffffffff. Halved as unsigned it is 0x7fffffff, and the signed answer
+    // for the same two values is 0.
+    try expect(@as(i32, 0x7fffffff), try binaryResult(.div_u, -1, 2));
+    try expect(@as(i32, 0), try binaryResult(.div, -1, 2));
+    try expect(@as(i32, 1), try binaryResult(.mod_u, -1, 2));
+
+    try expect(@as(i32, 3), try binaryResult(.div_u, 7, 2));
+    try expect(@as(i32, 1), try binaryResult(.mod_u, 7, 2));
+
+    // The pair that the signed instructions trap on has an unsigned answer:
+    // 0x80000000 / 0xffffffff is 0, because the divisor is the larger number.
+    try expectBinaryTrap(.div, std.math.minInt(i32), -1, error.IntegerOverflow);
+    try expect(@as(i32, 0), try binaryResult(.div_u, std.math.minInt(i32), -1));
+    try expect(@as(i32, std.math.minInt(i32)), try binaryResult(.mod_u, std.math.minInt(i32), -1));
+
+    // Division by zero has no answer either way.
+    try expectBinaryTrap(.div_u, 1, 0, error.DivisionByZero);
+    try expectBinaryTrap(.mod_u, 1, 0, error.DivisionByZero);
+}
+
+test "the arithmetic shift keeps the sign that the logical shift discards" {
+    const expect = std.testing.expectEqual;
+
+    try expect(@as(i32, -4), try binaryResult(.shr_s, -8, 1));
+    try expect(@as(i32, 0x7ffffffc), try binaryResult(.shr_u, -8, 1));
+    try expect(@as(i32, 4), try binaryResult(.shr_s, 8, 1));
+
+    // A negative value shifted far enough becomes -1 and stays there, because the
+    // bit that fills the value is the sign bit.
+    try expect(@as(i32, -1), try binaryResult(.shr_s, -1, 31));
+
+    // The count is the low five bits, as it is for every shift here. Therefore a
+    // count of 32 is a count of 0 and the value does not change.
+    try expect(@as(i32, -8), try binaryResult(.shr_s, -8, 32));
+}
+
+test "the wrapping arithmetic gives the low bits where the trapping form refuses" {
+    const expect = std.testing.expectEqual;
+    const max = std.math.maxInt(i32);
+    const min = std.math.minInt(i32);
+
+    try expectBinaryTrap(.sub, min, 1, error.IntegerOverflow);
+    try expect(@as(i32, max), try binaryResult(.sub_wrap, min, 1));
+
+    try expectBinaryTrap(.mul, max, 2, error.IntegerOverflow);
+    try expect(@as(i32, -2), try binaryResult(.mul_wrap, max, 2));
+
+    // Where the result fits, the two forms agree.
+    try expect(@as(i32, 4), try binaryResult(.sub_wrap, 10, 6));
+    try expect(@as(i32, 60), try binaryResult(.mul_wrap, 10, 6));
+
+    // The unsigned reading of the wrapped result is the one a C program wants:
+    // 0 - 1 is 0xffffffff.
+    try expect(@as(i32, -1), try binaryResult(.sub_wrap, 0, 1));
+}
+
+test "an indirect call reaches a function that no instruction names" {
+    // The address is a value here, so nothing in the code region names offset 7 and
+    // the walk at load time never reaches it. The function is therefore verified
+    // when the call goes to it, and it runs.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    const program = push(7) ++ [_]u8{ opByte(.call_indirect), opByte(.halt) } ++
+        push(42) ++ [_]u8{opByte(.ret)};
+
+    try harness.vm.loadProgram(&program);
+    // Before the run the function is bytes that the verifier has not looked at.
+    try std.testing.expectEqual(bytecode.verify.Mark.unknown, harness.vm.verify_scratch[7]);
+
+    try harness.vm.run();
+
+    try std.testing.expectEqual(@as(usize, 1), harness.vm.sp);
+    try std.testing.expectEqual(@as(i32, 42), harness.vm.stack[0]);
+    // The call left the marks behind, so a second call to the same address answers
+    // from one byte and verifies nothing again.
+    try std.testing.expectEqual(bytecode.verify.Mark.boundary, harness.vm.verify_scratch[7]);
+}
+
+test "an indirect call refuses a target that is not a whole instruction" {
+    // Offset 1 is inside the `push` at offset 0, which the walk at load time marked.
+    // A call there would read an operand byte as an opcode.
+    try expectContainerTrap(
+        &(push(1) ++ [_]u8{ opByte(.call_indirect), opByte(.halt) }),
+        error.MisalignedTarget,
+    );
+
+    // A function that does not verify is refused at the call rather than run. The
+    // byte at offset 7 has no instruction.
+    try expectContainerTrap(
+        &(push(7) ++ [_]u8{ opByte(.call_indirect), opByte(.halt), 0xfe }),
+        error.UnknownOpcode,
+    );
+
+    // The same check that a direct call gets: control must not continue past the end
+    // of the code region. The `push` at offset 7 falls through to offset 12, which is
+    // the end.
+    try expectContainerTrap(
+        &(push(7) ++ [_]u8{ opByte(.call_indirect), opByte(.halt) } ++ push(1)),
+        error.ExecutionRunsOffEnd,
+    );
+}
+
+test "bare code has no marks, so an indirect call verifies from the target" {
+    // A file with no header is not verified when it loads, so nothing says where an
+    // instruction begins. An indirect call into such a program therefore decodes
+    // from the address it was given and checks what that reaches, which is all a
+    // program without a verified code region can offer. The run-time checks are the
+    // same either way.
+    //
+    // Here offset 1 is inside the `push` at offset 0, and the operand byte there
+    // happens to decode as another `push`. A container gives `MisalignedTarget` for
+    // exactly this program; bare code cannot know.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    try harness.vm.loadProgram(&(push(1) ++ [_]u8{ opByte(.call_indirect), opByte(.halt) }));
+    try harness.vm.run();
+}
+
+test "an indirect call refuses an address that is not in the code region" {
+    // A negative value has no unsigned equivalent, and an address past the code is
+    // not an instruction. Neither is a fault in the function that was called,
+    // because there is no function there.
+    try expectTrap(
+        &(push(-1) ++ [_]u8{ opByte(.call_indirect), opByte(.halt) }),
+        error.SegmentFault,
+        "",
+    );
+    try expectTrap(
+        &(push(64) ++ [_]u8{ opByte(.call_indirect), opByte(.halt) }),
+        error.SegmentFault,
+        "",
+    );
+    // The target comes off the stack, so an empty stack has none to give.
+    try expectTrap(&[_]u8{ opByte(.call_indirect), opByte(.halt) }, error.StackUnderflow, "");
+}
+
+test "a refused indirect call records where the verifier stopped" {
+    // The failure names the instruction inside the function, and not the address that
+    // the program called. A caller that reports both tells the whole story.
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+
+    const program = push(7) ++ [_]u8{ opByte(.call_indirect), opByte(.halt) } ++
+        push(1) ++ [_]u8{ opByte(.jmp), 200, 0, 0, 0 };
+
+    try harness.vm.loadProgram(&program);
+    try std.testing.expectError(error.TargetOutOfRange, harness.vm.run());
+
+    const failure = harness.vm.verification_failure.?;
+    try std.testing.expectEqual(error.TargetOutOfRange, failure.reason);
+    // The `jmp` is at offset 12, after the five-byte `push` at 7.
+    try std.testing.expectEqual(@as(usize, 12), failure.offset);
 }
 
 test "load_at and store_at are the 32-bit byte-addressed instructions" {

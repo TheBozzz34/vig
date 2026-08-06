@@ -490,6 +490,126 @@ test "a narrow value keeps its bits and the load decides its sign" {
     );
 }
 
+test "a function pointer is stored, loaded and called" {
+    // `int (*f)(int) = add_one; print(f(41));` The address of a function is a value
+    // like any other, so it goes in memory with `store` and comes back with `load`.
+    try expectSourceOutput(
+        \\entry main
+        \\main:
+        \\  push add_one
+        \\  store handler
+        \\  push 41
+        \\  load handler
+        \\  call_indirect
+        \\  print
+        \\  halt
+        \\add_one:
+        \\  enter 1 0
+        \\  load_local 0
+        \\  push 1
+        \\  add
+        \\  ret_val
+        \\handler:
+        \\  reserve 4
+    ,
+        "42\n",
+    );
+}
+
+test "a table of function pointers dispatches on an index" {
+    // `int (*table[])(int) = {add_one, double};` and then `table[1](21)`. The data
+    // directive writes the two addresses and `call_indirect` reaches whichever one
+    // the program picked. Neither function is named by any instruction, so the walk
+    // at load time reaches neither and each is verified at its first call.
+    try expectSourceOutput(
+        \\entry main
+        \\main:
+        \\  push 21
+        \\  push table+4
+        \\  load32
+        \\  call_indirect
+        \\  print
+        \\  halt
+        \\add_one:
+        \\  enter 1 0
+        \\  load_local 0
+        \\  push 1
+        \\  add
+        \\  ret_val
+        \\double:
+        \\  enter 1 0
+        \\  load_local 0
+        \\  push 2
+        \\  mul
+        \\  ret_val
+        \\table:
+        \\  i32 add_one, double
+    ,
+        "42\n",
+    );
+}
+
+test "unsigned instructions treat the high bit as value and not as sign" {
+    // A C compiler emits these for `unsigned int`. The value 0xffffffff is -1 to the
+    // signed instructions and 4294967295 to these, and `print` shows the signed
+    // reading of whatever bits are left.
+    try expectSourceOutput(
+        \\entry main
+        \\main:
+        \\  # 0xffffffff / 2 is 0x7fffffff as unsigned, and 0 as signed.
+        \\  push -1
+        \\  push 2
+        \\  div_u
+        \\  print
+        \\  pop
+        \\  push -1
+        \\  push 2
+        \\  div
+        \\  print
+        \\  pop
+        \\  # 1 < 0xffffffff as unsigned. The signed test says the opposite.
+        \\  push 1
+        \\  push -1
+        \\  lt_u
+        \\  print
+        \\  pop
+        \\  push 1
+        \\  push -1
+        \\  lt
+        \\  print
+        \\  halt
+    ,
+        "2147483647\n0\n1\n0\n",
+    );
+}
+
+test "the wrapping and arithmetic-shift instructions round out the C operators" {
+    try expectSourceOutput(
+        \\entry main
+        \\main:
+        \\  # -8 >> 1 keeps the sign; the logical shift does not.
+        \\  push -8
+        \\  push 1
+        \\  shr_s
+        \\  print
+        \\  pop
+        \\  # 0 - 1 wraps to 0xffffffff rather than trapping.
+        \\  push 0
+        \\  push 1
+        \\  sub_wrap
+        \\  print
+        \\  pop
+        \\  # 65536 * 65536 keeps its low 32 bits, which are zero.
+        \\  push 65536
+        \\  push 65536
+        \\  mul_wrap
+        \\  print
+        \\  halt
+    ,
+        "-4\n-1\n0\n",
+    );
+}
+
 test "a store into the code region is refused" {
     // Address 0 is the first byte of the code. A program that could write there
     // would make the work of the verifier meaningless, because the bytes it checked

@@ -81,7 +81,18 @@ pub fn main(init: std.process.Init) !void {
         // Flush the output first. Then the output of the program comes before
         // the error message on stderr.
         stdout.interface.flush() catch {};
-        std.log.err("VM execution failed: {s}", .{@errorName(err)});
+
+        // An indirect call verifies the function it names, so a run can end with an
+        // error from the verifier. That failure holds the offset of the instruction
+        // inside the function, which the name of the error does not give.
+        if (vm.verification_failure) |failure| {
+            std.log.err(
+                "VM execution failed at code offset {d}: {s}",
+                .{ failure.offset, @errorName(failure.reason) },
+            );
+        } else {
+            std.log.err("VM execution failed: {s}", .{@errorName(err)});
+        }
         return err;
     };
     try stdout.interface.flush();
