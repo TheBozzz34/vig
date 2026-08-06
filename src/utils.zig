@@ -5,21 +5,19 @@ const std = @import("std");
 
 const Io = std.Io;
 
-/// The largest program file that a tool here reads. A container holds the header and
-/// the import table as well as the image, so the file can be larger than the memory
-/// of the VM.
-pub const max_program_file_size = constants.max_program_file_size;
-
 pub fn loadProgramFromFile(vm: *machine.VM, io: Io, allocator: std.mem.Allocator, path: []const u8) !void {
     // The VM removes the container header and the import table before the code
     // goes into VM memory. Permit the largest correct container and a full memory
     // image. Read one more byte. Then a file that is too large is different from
     // a file of the exact size.
+    //
+    // The limit comes from the VM, because the memory of a VM is now a value that
+    // the caller chose and not a number this file knows.
     const program = try std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
         allocator,
-        .limited(constants.max_program_file_size + 1),
+        .limited(vm.maxProgramFileSize() + 1),
     );
     defer allocator.free(program);
 
@@ -31,7 +29,7 @@ test "file loader permits a full memory image behind a container header" {
     defer tmp.cleanup();
 
     // A code region of `halt` instructions with the size of the VM memory.
-    const code: [constants.memory_size]u8 = @splat(@intFromEnum(bytecode.OpCode.halt));
+    const code: [constants.testing.memory_size]u8 = @splat(@intFromEnum(bytecode.OpCode.halt));
     const layout: bytecode.container.Layout = .{ .code = &code };
 
     const program = try std.testing.allocator.alloc(
@@ -52,14 +50,13 @@ test "file loader permits a full memory image behind a container header" {
     );
     defer std.testing.allocator.free(path);
 
-    // The VM is too large for the stack of a test function, so it goes on the heap.
     const vm = try std.testing.allocator.create(machine.VM);
     defer std.testing.allocator.destroy(vm);
-    vm.init(undefined, undefined);
+    vm.init(std.testing.allocator, constants.testing, undefined, undefined) catch @panic("OOM");
     defer vm.deinit();
     try loadProgramFromFile(vm, std.testing.io, std.testing.allocator, path);
-    try std.testing.expectEqual(constants.memory_size, vm.program_len);
-    try std.testing.expectEqual(constants.memory_size, vm.code_len);
+    try std.testing.expectEqual(constants.testing.memory_size, vm.program_len);
+    try std.testing.expectEqual(constants.testing.memory_size, vm.code_len);
 }
 
 // Compare two integers. Put the result on the stack.

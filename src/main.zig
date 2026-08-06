@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const bytecode = @import("vig_bytecode");
 const Io = std.Io;
 const machine = @import("machine.zig");
+const constants = @import("constants.zig");
 const utils = @import("utils.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -12,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
 
     // Read the command-line arguments.
-    const args = try init.minimal.args.toSlice(arena);
+    var args = try init.minimal.args.toSlice(arena);
 
     // The output of the program goes to stdout. Therefore a user can send it to
     // a pipe or to a file. The `std.log` diagnostic messages go to stderr.
@@ -25,12 +26,22 @@ pub fn main(init: std.process.Init) !void {
     var stdin_buffer: [4096]u8 = undefined;
     var stdin = Io.File.stdin().readerStreaming(init.io, &stdin_buffer);
 
-    // The VM holds the guest memory and the verifier scratch inline, so it is too
-    // large for the stack of this function. The arena lives as long as the process.
+    // `--memory` sets the size of the guest address space. A hand-written program
+    // runs in a few kilobytes and a compiled one does not, and the size is a property
+    // of the program rather than of this build.
+    var config: machine.Config = .{};
+    args = try takeMemoryOption(arena, args, &config);
+
     const vm = try arena.create(machine.VM);
-    vm.init(&stdin.interface, &stdout.interface);
+    vm.init(init.gpa, config, &stdin.interface, &stdout.interface) catch |err| {
+        std.log.err("Cannot make a VM with {d} bytes of memory: {s}", .{
+            config.memory_size,
+            @errorName(err),
+        });
+        return err;
+    };
     defer vm.deinit();
-    std.log.info("VM initialized successfully.", .{});
+    std.log.info("VM initialized with {d} bytes of memory.", .{vm.memory.len});
 
     // `--disasm` writes the program as a listing and runs nothing. A person reading
     // the output of a compiler needs to see the instructions that came out, and a
@@ -39,12 +50,12 @@ pub fn main(init: std.process.Init) !void {
         (std.mem.eql(u8, args[1], "--disasm") or std.mem.eql(u8, args[1], "-d"));
 
     if (args.len > 2 and !disassemble) {
-        std.log.err("Usage: vig [--disasm] [program-file]", .{});
+        std.log.err("Usage: vig [--memory <bytes>] [--disasm] [program-file]", .{});
         return error.InvalidArguments;
     }
 
     if (disassemble) {
-        try disassembleFile(init.io, arena, args[2], &stdout.interface);
+        try disassembleFile(init.io, arena, config, args[2], &stdout.interface);
         try stdout.interface.flush();
         return;
     }
@@ -114,6 +125,45 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("VM execution completed successfully.", .{});
 }
 
+/// The command line, in the form that `std.process.Init` gives it.
+const Args = []const [:0]const u8;
+
+/// Read a `--memory <size>` option off the front of `args` and give back the rest.
+///
+/// The size is a number of bytes, and a `K` or an `M` suffix multiplies it. Nobody
+/// wants to write 1048576, and a VM that a person sizes by hand is the point of the
+/// option.
+fn takeMemoryOption(allocator: std.mem.Allocator, args: Args, config: *machine.Config) !Args {
+    if (args.len < 3 or !std.mem.eql(u8, args[1], "--memory")) return args;
+
+    config.memory_size = parseSize(args[2]) catch {
+        std.log.err("--memory takes a size, for example 65536, 512K or 4M", .{});
+        return error.InvalidArguments;
+    };
+
+    // The first argument is the name of the program, and the two that this option
+    // used are gone. Therefore the rest is what a caller with no option would have,
+    // and every check after this one reads it without knowing about the option.
+    const rest = try allocator.alloc([:0]const u8, args.len - 2);
+    rest[0] = args[0];
+    @memcpy(rest[1..], args[3..]);
+    return rest;
+}
+
+fn parseSize(text: []const u8) !usize {
+    if (text.len == 0) return error.InvalidSize;
+
+    const multiplier: usize = switch (text[text.len - 1]) {
+        'k', 'K' => 1024,
+        'm', 'M' => 1024 * 1024,
+        else => 1,
+    };
+    const digits = if (multiplier == 1) text else text[0 .. text.len - 1];
+
+    const value = try std.fmt.parseInt(usize, digits, 10);
+    return std.math.mul(usize, value, multiplier) catch error.InvalidSize;
+}
+
 /// Write the program in `path` as a listing.
 ///
 /// The import names come from the container, so a `foreign_call` names its import as
@@ -122,14 +172,17 @@ pub fn main(init: std.process.Init) !void {
 fn disassembleFile(
     io: Io,
     allocator: std.mem.Allocator,
+    config: machine.Config,
     path: []const u8,
     writer: *Io.Writer,
 ) !void {
+    // The listing needs no VM, but the limit on the file is the same one a run would
+    // apply: a file that no VM of this size could load is not one to disassemble.
     const bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
         allocator,
-        .limited(utils.max_program_file_size + 1),
+        .limited(constants.maxProgramFileSize(config.memory_size) + 1),
     );
     const image = try bytecode.container.parse(bytes);
 

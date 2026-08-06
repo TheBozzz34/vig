@@ -29,6 +29,28 @@ so the walk at load time does not find it. Such a function is verified the first
 time a call goes to it, and the result is kept. The code region cannot change while
 a program runs, so the answer is the one a check before the run would have given.
 
+## Memory
+
+The guest address space defaults to **1 MiB** and `--memory` changes it:
+
+```bash
+vig --memory 16M program.vig
+```
+
+The size takes a `K` or `M` suffix. The ceiling is 2 GiB, because a guest pointer is
+a value on the operand stack and the stack holds an `i32`: no program can name a byte
+above that however large the memory is.
+
+The memory, the operand stack, the call stack and the verifier scratch all come from
+an allocator, so the size is a property of the program being run and not of this
+build. One `vig` runs a hand-written example in a few kilobytes and a compiled
+program in as much as it needs.
+
+The verifier scratch is one mark per byte of **code**, not per byte of memory. It
+was the second of those, which cost one byte of host memory for every byte of guest
+memory whatever the program held: at 1 MiB of memory, `md5.vigas` needs 2,333 marks
+rather than 1,048,576.
+
 ## Reading a program
 
 `vig --disasm program.vig` writes the program as a listing instead of running it:

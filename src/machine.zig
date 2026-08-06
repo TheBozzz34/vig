@@ -55,22 +55,29 @@ const empty_frame: CallFrame = .{
 /// holds. A wider C type needs more than one slot, and the compiler decides that.
 const slot_size = 4;
 
+/// The sizes that a VM is built with. See `constants.Config`.
+pub const Config = constants.Config;
+
 /// The virtual machine.
 ///
-/// This structure holds the guest memory, the stacks and the verifier scratch
-/// inline, so it is far larger than a machine register and it grows with
-/// `constants.memory_size`.
+/// The guest memory, the two stacks and the verifier scratch come from an allocator,
+/// so this structure is a handful of slices and registers whatever size the memory
+/// has. A caller gives the sizes to `init` and frees them with `deinit`.
 pub const VM = struct {
+    // Where the memory and the stacks came from, so that `deinit` can give them
+    // back and `loadProgram` can grow the verifier scratch.
+    allocator: std.mem.Allocator,
+
     // The guest address space: one array of bytes. Every instruction that touches
     // guest data addresses this array by byte, and a label, a pointer and the
     // operand of `load` all mean the same kind of number.
-    memory: [constants.memory_size]u8,
+    memory: []u8,
 
     // The evaluation stack.
-    stack: [constants.stack_size]i32,
+    stack: []i32,
 
     // The call stack for the `call` and `ret` instructions.
-    call_stack: [constants.call_stack_size]CallFrame,
+    call_stack: []CallFrame,
     csp: usize,
 
     // The lowest address that a frame uses. Frame memory grows down from the end of
@@ -112,26 +119,29 @@ pub const VM = struct {
     sp: usize = 0, // the stack pointer
 
     // Working space for the bytecode verifier: one mark for each byte of the code
-    // region. The verifier needs `verify.scratchSize(code_len)` marks, and the
-    // code region is never larger than the memory of the VM.
+    // region.
     //
-    // This buffer is a field and not a local of `verifyImage`, because a local
-    // puts it on the call stack. At the present `memory_size` that costs 4 KiB,
-    // which a stack absorbs; at the size that a C program needs it does not. The
-    // cost of the field is one byte of memory for each byte of guest memory, and
-    // the VM pays it once rather than on each load.
-    verify_scratch: [constants.memory_size]verify.Mark,
+    // This buffer belongs to the VM and not to `verifyImage`, because `call_indirect`
+    // reads it while a program runs: a function that only a pointer names is verified
+    // at the call, and the marks are what say whether an earlier call already did it.
+    //
+    // It grows to the code region of the program that is loaded, and not to the size
+    // of guest memory. The two were the same size once, which cost one byte of host
+    // memory for each byte of guest memory whatever the program held. A program is
+    // mostly data, so this is now a fraction of that.
+    verify_scratch: []verify.Mark,
 
-    // Set the state of the VM to its initial values.
+    // Set the state of the VM to its initial values. The memory and the stacks keep
+    // the sizes that `init` gave them.
     pub fn reset(self: *VM) void {
         self.clearForeignImports();
-        @memset(&self.stack, 0);
-        @memset(&self.memory, 0);
-        @memset(&self.call_stack, empty_frame);
+        @memset(self.stack, 0);
+        @memset(self.memory, 0);
+        @memset(self.call_stack, empty_frame);
         // The marks belong to the program that made them. `call_indirect` reads them
         // while a program runs, so a mark that an earlier program left would answer
         // for code that is no longer there.
-        @memset(&self.verify_scratch, .unknown);
+        @memset(self.verify_scratch, .unknown);
 
         self.code_len = 0;
         self.program_len = 0;
@@ -144,19 +154,49 @@ pub const VM = struct {
         self.frame_pointer = self.memory.len;
     }
 
+    /// Give back the memory and the stacks, and release every foreign library.
     pub fn deinit(self: *VM) void {
         self.clearForeignImports();
+        self.allocator.free(self.memory);
+        self.allocator.free(self.stack);
+        self.allocator.free(self.call_stack);
+        self.allocator.free(self.verify_scratch);
+        self.* = undefined;
     }
 
-    // Give a VM its default values, in the storage that the caller supplies. The
-    // streams must stay in existence longer than the VM. `reset` does not change
-    pub fn init(self: *VM, input: *Io.Reader, output: *Io.Writer) void {
+    /// Build a VM with the sizes in `config`. The streams must stay in existence
+    /// longer than the VM, and `deinit` gives the memory back.
+    ///
+    /// The verifier scratch starts empty. `loadProgram` grows it to the code region
+    /// of the program it is given, which is the only place that knows how much of the
+    /// memory is instructions.
+    pub fn init(
+        self: *VM,
+        allocator: std.mem.Allocator,
+        config: Config,
+        input: *Io.Reader,
+        output: *Io.Writer,
+    ) !void {
+        try config.check();
+
+        const memory = try allocator.alloc(u8, config.memory_size);
+        errdefer allocator.free(memory);
+        const stack = try allocator.alloc(i32, config.stack_size);
+        errdefer allocator.free(stack);
+        const call_stack = try allocator.alloc(CallFrame, config.call_stack_size);
+        errdefer allocator.free(call_stack);
+
+        @memset(memory, 0);
+        @memset(stack, 0);
+        @memset(call_stack, empty_frame);
+
         self.* = .{
-            .memory = @splat(0),
-            .stack = @splat(0),
-            .call_stack = @splat(empty_frame),
+            .allocator = allocator,
+            .memory = memory,
+            .stack = stack,
+            .call_stack = call_stack,
             .csp = 0,
-            .frame_pointer = constants.memory_size,
+            .frame_pointer = config.memory_size,
             .foreign_imports = @splat(null),
             .foreign_import_count = 0,
             .code_len = 0,
@@ -166,8 +206,13 @@ pub const VM = struct {
             .output = output,
             .sp = 0,
             .ip = 0,
-            .verify_scratch = @splat(.unknown),
+            .verify_scratch = &.{},
         };
+    }
+
+    /// The largest program file that this VM can load.
+    pub fn maxProgramFileSize(self: *const VM) usize {
+        return constants.maxProgramFileSize(self.memory.len);
     }
 
     // Load a program into the memory of the VM. The file can be a current container
@@ -187,6 +232,10 @@ pub const VM = struct {
         if (!image.kind.isExecutable()) return error.ObsoleteProgramFormat;
 
         if (image.imageLen() > self.memory.len) return error.ProgramTooLarge;
+
+        // The marks are for the code of this program. `reset` cleared what the last
+        // one left; this gives the verifier a mark for each byte it is about to read.
+        try self.growVerifyScratch(image.code.len);
 
         // Only a container keeps the code apart from the static data. The verifier
         // needs this split to read the instructions and to decode no string. Bare
@@ -931,7 +980,7 @@ pub const VM = struct {
     /// `code` is the code region in guest memory rather than the slice of the
     /// container, because the container is gone once the program is loaded. The two
     /// hold the same bytes: the region is read-only for the whole run.
-    fn verifyOptions(code: []const u8, entry_point: u32, import_count: u8) verify.Options {
+    fn verifyOptions(self: *const VM, code: []const u8, entry_point: u32, import_count: u8) verify.Options {
         return .{
             .code = code,
             .entry_point = entry_point,
@@ -940,25 +989,35 @@ pub const VM = struct {
             // Therefore an address in a `load` or a `store` operand, and a `store`
             // that would write an instruction, are both found before any of the
             // program runs.
-            .memory_size = constants.memory_size,
+            .memory_size = @intCast(self.memory.len),
             .code_len = @intCast(code.len),
         };
+    }
+
+    /// Give the verifier one mark for each byte of a code region of `code_len`, and
+    /// set every mark to `unknown`.
+    ///
+    /// The scratch is kept between programs, so a program no larger than the last one
+    /// needs no allocation. It is cleared either way: `call_indirect` reads these
+    /// marks while the program runs, and a mark that an earlier program left would
+    /// answer for code that is no longer there.
+    fn growVerifyScratch(self: *VM, code_len: usize) !void {
+        if (self.verify_scratch.len < code_len) {
+            self.verify_scratch = try self.allocator.realloc(self.verify_scratch, code_len);
+        }
+        @memset(self.verify_scratch, .unknown);
     }
 
     // Make sure that the code region is safe to execute before the VM runs any of
     // it. The vig-bytecode verifier gives the list of the checks.
     fn verifyImage(self: *VM, image: container.Image) !void {
-        // One mark for each code byte. The VM has already checked the image
-        // against the size of the VM memory, so `verify_scratch` is large enough.
-        std.debug.assert(image.code.len <= self.verify_scratch.len);
-
         var failure: verify.Failure = undefined;
-        const options = verifyOptions(
+        const options = self.verifyOptions(
             image.code,
             image.header.entry_point,
             image.header.import_count,
         );
-        verify.verify(options, &self.verify_scratch, &failure) catch |err| {
+        verify.verify(options, self.verify_scratch, &failure) catch |err| {
             self.verification_failure = failure;
             return err;
         };
@@ -978,13 +1037,13 @@ pub const VM = struct {
         if (self.verify_scratch[target] == .boundary) return;
 
         var failure: verify.Failure = undefined;
-        const options = verifyOptions(
+        const options = self.verifyOptions(
             self.memory[0..self.code_len],
             // The entry point is not read by `verifyFrom`, which starts at `target`.
             0,
             @intCast(self.foreign_import_count),
         );
-        verify.verifyFrom(options, &self.verify_scratch, target, &failure) catch |err| {
+        verify.verifyFrom(options, self.verify_scratch, target, &failure) catch |err| {
             // The failure names the instruction that the verifier refused, which is
             // inside the function and not the address that was called. A caller that
             // reports both tells the whole story.
@@ -1076,7 +1135,7 @@ const Harness = struct {
         // `start` sets the stream pointers after the harness has its final
         // address. A pointer taken here becomes invalid when this function gives
         // a copy of the harness to the caller.
-        vm.init(undefined, undefined);
+        vm.init(std.testing.allocator, constants.testing, undefined, undefined) catch @panic("OOM");
 
         return .{
             .input = .fixed(input),
@@ -1312,7 +1371,7 @@ test "a container is verified before any of it runs" {
 }
 
 test "a program larger than VM memory is rejected" {
-    const code: [constants.memory_size]u8 = @splat(opByte(.halt));
+    const code: [constants.testing.memory_size]u8 = @splat(opByte(.halt));
     const program = try buildContainer(.{ .code = &code, .data = "!" });
     defer std.testing.allocator.free(program);
 
@@ -1884,7 +1943,7 @@ test "load_at and store_at are the 32-bit byte-addressed instructions" {
 }
 
 test "a calculated address is bounded, and its width is part of the bound" {
-    const last: i32 = constants.memory_size - 1;
+    const last: i32 = constants.testing.memory_size - 1;
 
     // The widest access that still fits works.
     try expectOutput(
@@ -1895,7 +1954,7 @@ test "a calculated address is bounded, and its width is part of the bound" {
     // One byte further needs four bytes and has three.
     try expectTrap(&(push(last - 2) ++ [_]u8{ opByte(.load_at), opByte(.halt) }), error.SegmentFault, "");
     try expectTrap(
-        &(push(constants.memory_size) ++ [_]u8{ opByte(.load_at), opByte(.halt) }),
+        &(push(constants.testing.memory_size) ++ [_]u8{ opByte(.load_at), opByte(.halt) }),
         error.SegmentFault,
         "",
     );
@@ -1910,7 +1969,7 @@ test "a calculated address is bounded, and its width is part of the bound" {
 test "the data stack overflows rather than growing without bound" {
     var program = std.ArrayList(u8).empty;
     defer program.deinit(std.testing.allocator);
-    for (0..constants.stack_size + 1) |_| {
+    for (0..constants.testing.stack_size + 1) |_| {
         try program.appendSlice(std.testing.allocator, &push(0));
     }
     try expectTrap(program.items, error.StackOverflow, "");
@@ -1919,7 +1978,7 @@ test "the data stack overflows rather than growing without bound" {
 // A program that fills the data stack to its capacity. The instructions that
 // follow it therefore have no room for a result.
 fn fullStack(program: *std.ArrayList(u8)) !void {
-    for (0..constants.stack_size) |_| {
+    for (0..constants.testing.stack_size) |_| {
         try program.appendSlice(std.testing.allocator, &push(0));
     }
 }
@@ -1954,7 +2013,7 @@ test "every instruction that produces a value checks for stack overflow" {
         try std.testing.expectError(error.StackOverflow, harness.vm.run());
         // The instruction refused to run. Therefore it left the stack full and
         // did not go past its capacity.
-        try std.testing.expectEqual(constants.stack_size, harness.vm.sp);
+        try std.testing.expectEqual(constants.testing.stack_size, harness.vm.sp);
     }
 
     // `load` reads the data segment onto the stack and needs the same check.
@@ -1981,7 +2040,7 @@ test "recursion without an end overflows the call stack" {
 
     try harness.vm.loadProgram(&program);
     try std.testing.expectError(error.CallStackOverflow, harness.vm.run());
-    try std.testing.expectEqual(constants.call_stack_size, harness.vm.csp);
+    try std.testing.expectEqual(constants.testing.call_stack_size, harness.vm.csp);
 }
 
 test "an operand that runs past the end of the code region gives a fault" {
@@ -2025,7 +2084,7 @@ test "a foreign call to an import that does not exist gives a fault" {
 test "a load or store operand is bounded at run time and not only by the verifier" {
     // A container has its `load` and `store` operands checked at load time. Bare
     // code has no such check, so the same rules must hold while it runs.
-    const past_end: u32 = constants.memory_size;
+    const past_end: u32 = constants.testing.memory_size;
 
     try expectTrap(
         &(withAddress(.load, past_end) ++ [_]u8{opByte(.halt)}),
@@ -2034,7 +2093,7 @@ test "a load or store operand is bounded at run time and not only by the verifie
     );
     // Three bytes from the end is inside memory, but its four-byte access is not.
     try expectTrap(
-        &(withAddress(.load, constants.memory_size - 3) ++ [_]u8{opByte(.halt)}),
+        &(withAddress(.load, constants.testing.memory_size - 3) ++ [_]u8{opByte(.halt)}),
         error.SegmentFault,
         "",
     );
@@ -2149,7 +2208,7 @@ test "a frame is released when its function returns" {
     try vm.run();
 
     // Every frame is gone, so frame memory has used nothing.
-    try std.testing.expectEqual(constants.memory_size, vm.frame_pointer);
+    try std.testing.expectEqual(constants.testing.memory_size, vm.frame_pointer);
     try std.testing.expectEqual(@as(usize, 0), vm.csp);
 }
 
@@ -2353,7 +2412,7 @@ test "a load may read the code region" {
 }
 
 test "an access must fit inside memory, and its width is part of that" {
-    const last: i32 = constants.memory_size - 1;
+    const last: i32 = constants.testing.memory_size - 1;
 
     // The last byte of memory is a place to put one byte, so a one-byte access
     // there works. Memory starts as zeros, so that is what it reads.
@@ -2380,7 +2439,7 @@ test "an access must fit inside memory, and its width is part of that" {
     );
     // The first address fully outside memory.
     try expectTrap(
-        &(push(constants.memory_size) ++ [_]u8{ opByte(.load8_u), opByte(.halt) }),
+        &(push(constants.testing.memory_size) ++ [_]u8{ opByte(.load8_u), opByte(.halt) }),
         error.SegmentFault,
         "",
     );
@@ -2466,4 +2525,159 @@ test "the operand form and the stack form reach the same bytes" {
 
     try std.testing.expectEqualStrings("11\n22\n", harness.written());
     try std.testing.expectEqual(@as(i32, 22), harness.vm.readMemory(i32, 400));
+}
+
+// The sizes of a VM --------------------------------------------------------
+
+/// A VM with the given sizes, and the streams it needs to exist. The caller calls
+/// `deinit` and `destroy`.
+fn vmWith(config: Config, input: *Io.Reader, output: *Io.Writer) !*VM {
+    const vm = try std.testing.allocator.create(VM);
+    errdefer std.testing.allocator.destroy(vm);
+    try vm.init(std.testing.allocator, config, input, output);
+    return vm;
+}
+
+test "the size of a VM does not depend on the size of its memory" {
+    // The memory, the stacks and the verifier scratch come from an allocator, so what
+    // is left inline is the import table and a handful of slices and registers. The
+    // structure held all four inline before, which cost two bytes of host memory for
+    // each byte of guest memory whatever the program held.
+    const imports = @sizeOf([bytecode.foreign.max_imports]?foreign.Import);
+    try std.testing.expect(@sizeOf(VM) < imports + 256);
+}
+
+test "a VM takes the sizes it is given" {
+    var input: Io.Reader = .fixed("");
+    var collected: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer collected.deinit();
+
+    const vm = try vmWith(
+        .{ .memory_size = 4096, .stack_size = 8, .call_stack_size = 4 },
+        &input,
+        &collected.writer,
+    );
+    defer std.testing.allocator.destroy(vm);
+    defer vm.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4096), vm.memory.len);
+    try std.testing.expectEqual(@as(usize, 8), vm.stack.len);
+    try std.testing.expectEqual(@as(usize, 4), vm.call_stack.len);
+    // Frame memory grows down from the end of whatever memory the VM was given.
+    try std.testing.expectEqual(@as(usize, 4096), vm.frame_pointer);
+
+    // The limits move with the sizes. This stack holds eight values, so the ninth
+    // `push` has nowhere to go, where the default stack would take it.
+    var program: std.ArrayList(u8) = .empty;
+    defer program.deinit(std.testing.allocator);
+    for (0..9) |_| try program.appendSlice(std.testing.allocator, &push(1));
+    try program.append(std.testing.allocator, opByte(.halt));
+
+    try vm.loadProgram(program.items);
+    try std.testing.expectError(error.StackOverflow, vm.run());
+    try std.testing.expectEqual(@as(usize, 8), vm.sp);
+}
+
+test "an address is bounded by the memory the VM was given and not by a constant" {
+    var input: Io.Reader = .fixed("");
+    var collected: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer collected.deinit();
+
+    const vm = try vmWith(.{ .memory_size = 1024 }, &input, &collected.writer);
+    defer std.testing.allocator.destroy(vm);
+    defer vm.deinit();
+
+    // The last byte is inside this memory and the one after it is not. A VM with more
+    // memory would take both.
+    try vm.loadProgram(&(push(1023) ++ [_]u8{ opByte(.load8_u), opByte(.halt) }));
+    try vm.run();
+
+    vm.reset();
+    try vm.loadProgram(&(push(1024) ++ [_]u8{ opByte(.load8_u), opByte(.halt) }));
+    try std.testing.expectError(error.SegmentFault, vm.run());
+}
+
+test "a config that no VM can honour is refused" {
+    var input: Io.Reader = .fixed("");
+    var collected: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer collected.deinit();
+
+    const cases = [_]struct { config: Config, reason: anyerror }{
+        // A VM with no memory holds no program, and one with no stack runs no
+        // instruction that produces a value.
+        .{ .config = .{ .memory_size = 0 }, .reason = error.ConfigTooSmall },
+        .{ .config = .{ .stack_size = 0 }, .reason = error.ConfigTooSmall },
+        .{ .config = .{ .call_stack_size = 0 }, .reason = error.ConfigTooSmall },
+        // A guest pointer is an `i32`, so no program could name a byte above this.
+        .{
+            .config = .{ .memory_size = Config.max_memory_size + 1 },
+            .reason = error.MemoryTooLarge,
+        },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectError(
+            case.reason,
+            vmWith(case.config, &input, &collected.writer),
+        );
+    }
+}
+
+test "the verifier scratch grows to the code and not to the memory" {
+    var input: Io.Reader = .fixed("");
+    var collected: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer collected.deinit();
+
+    // A megabyte of memory. The scratch used to be the same size as this whatever the
+    // program held, which is the cost that this refactor removes.
+    const vm = try vmWith(.{ .memory_size = 1 << 20 }, &input, &collected.writer);
+    defer std.testing.allocator.destroy(vm);
+    defer vm.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), vm.verify_scratch.len);
+
+    const small = try buildContainer(.{ .code = &[_]u8{opByte(.halt)} });
+    defer std.testing.allocator.free(small);
+    try vm.loadProgram(small);
+    try std.testing.expectEqual(@as(usize, 1), vm.verify_scratch.len);
+
+    // A larger program grows it, and the scratch is still a fraction of the memory.
+    const larger = try buildContainer(.{ .code = &(push(1) ++ [_]u8{ opByte(.pop), opByte(.halt) }) });
+    defer std.testing.allocator.free(larger);
+    try vm.loadProgram(larger);
+    try std.testing.expectEqual(@as(usize, 7), vm.verify_scratch.len);
+    try std.testing.expect(vm.verify_scratch.len < vm.memory.len / 1000);
+}
+
+test "a mark from one program does not answer for the next" {
+    // The scratch is kept between programs, so a mark that an earlier program left
+    // could say that an address is the start of an instruction when the bytes there
+    // are now something else. `call_indirect` reads these marks while a program runs.
+    var input: Io.Reader = .fixed("");
+    var collected: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer collected.deinit();
+
+    const vm = try vmWith(constants.testing, &input, &collected.writer);
+    defer std.testing.allocator.destroy(vm);
+    defer vm.deinit();
+
+    // The first program reaches offset 7 and marks it.
+    const first = try buildContainer(.{
+        .code = &(push(7) ++ [_]u8{ opByte(.call_indirect), opByte(.halt) } ++
+            push(1) ++ [_]u8{ opByte(.pop), opByte(.ret) }),
+    });
+    defer std.testing.allocator.free(first);
+    try vm.loadProgram(first);
+    try vm.run();
+    try std.testing.expectEqual(bytecode.verify.Mark.boundary, vm.verify_scratch[7]);
+
+    // The second program is shorter and has no instruction at offset 7 at all. The
+    // marks of the first must not survive into it.
+    const second = try buildContainer(.{ .code = &[_]u8{opByte(.halt)} });
+    defer std.testing.allocator.free(second);
+    try vm.loadProgram(second);
+    try std.testing.expectEqual(bytecode.verify.Mark.boundary, vm.verify_scratch[0]);
+    for (vm.verify_scratch[1..]) |mark| {
+        try std.testing.expectEqual(bytecode.verify.Mark.unknown, mark);
+    }
 }

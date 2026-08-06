@@ -11,8 +11,8 @@ const machine = @import("machine.zig");
 const Io = std.Io;
 
 // A VM and the buffer that collects the output of its program. The VM is behind a
-// pointer, because it holds the guest memory inline and must not travel through
-// the return value of `init`.
+// pointer so that the harness can hand it out. It owns its memory through an
+// allocator, and `deinit` gives that memory back.
 const Harness = struct {
     input: Io.Reader,
     collected: Io.Writer.Allocating,
@@ -23,7 +23,7 @@ const Harness = struct {
         // `start` sets the stream pointers after the harness has its final
         // address. A pointer taken here becomes invalid when this function gives a
         // copy of the harness to the caller.
-        vm.init(undefined, undefined);
+        vm.init(std.testing.allocator, constants.testing, undefined, undefined) catch @panic("OOM");
 
         return .{
             .input = .fixed(input),
@@ -814,7 +814,7 @@ test "the assembler and the VM divide the address checks between them" {
     // program, so it accepts this operand. The VM knows that size, so its own
     // verification refuses the program when it loads it. This test fails if the two
     // stop agreeing about which addresses exist.
-    const source = std.fmt.comptimePrint("store {d}\nhalt", .{constants.memory_size});
+    const source = std.fmt.comptimePrint("store {d}\nhalt", .{constants.testing.memory_size});
     const program = try assembler.assemble(std.testing.allocator, source, null);
     defer std.testing.allocator.free(program);
 
@@ -832,6 +832,6 @@ test "the assembler and the VM divide the address checks between them" {
     );
 
     // The highest address that a four-byte store can use does assemble and load.
-    const last = std.fmt.comptimePrint("push 5\nstore {d}\nhalt", .{constants.memory_size - 4});
+    const last = std.fmt.comptimePrint("push 5\nstore {d}\nhalt", .{constants.testing.memory_size - 4});
     try expectSourceOutput(last, "");
 }

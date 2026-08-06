@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const assembler = @import("vig_assembler");
+const constants = @import("constants.zig");
 const machine = @import("machine.zig");
 const options = @import("example_options");
 
@@ -83,8 +84,8 @@ const md5_cases = [_]struct { input: []const u8, digest: []const u8 }{
 
 // Running one example -------------------------------------------------------
 
-// The VM is behind a pointer: it holds the guest memory inline and must not travel
-// through the return value of `init`.
+// The VM is behind a pointer so that the harness can hand it out. It owns its
+// memory through an allocator, and `deinit` gives that memory back.
 const Harness = struct {
     input: Io.Reader,
     collected: Io.Writer.Allocating,
@@ -92,7 +93,7 @@ const Harness = struct {
 
     fn init(input: []const u8) Harness {
         const vm = std.testing.allocator.create(machine.VM) catch @panic("OOM");
-        vm.init(undefined, undefined);
+        vm.init(std.testing.allocator, constants.testing, undefined, undefined) catch @panic("OOM");
 
         return .{
             .input = .fixed(input),
