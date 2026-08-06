@@ -401,6 +401,95 @@ test "an array of 32-bit values is summed through calculated byte addresses" {
     );
 }
 
+test "a table of initialized values is summed where the assembler put it" {
+    // The same loop as the test above, over a table that the source wrote out rather
+    // than one the program filled in. This is what a C compiler emits for
+    // `static int table[] = {10, 20, 30};`, and it is the whole path: the assembler
+    // writes the bytes, the container carries them, and the VM maps them at the
+    // address that the label resolved to.
+    try expectSourceOutput(
+        \\entry main
+        \\main:
+        \\  push 0
+        \\  store total
+        \\  push table
+        \\  store cursor
+        \\loop:
+        \\  load total
+        \\  load cursor
+        \\  load32
+        \\  add
+        \\  store total
+        \\  load cursor
+        \\  push 4
+        \\  add
+        \\  store cursor
+        \\  load cursor
+        \\  push table+12
+        \\  ne
+        \\  jmp_not_zero loop
+        \\  load total
+        \\  print
+        \\  halt
+        \\table:
+        \\  i32 10, 20, 30
+        \\total:
+        \\  reserve 4
+        \\cursor:
+        \\  reserve 4
+    ,
+        "60\n",
+    );
+}
+
+test "a pointer in the data region reaches the string it names" {
+    // `char *greeting = message;` is one value that holds an address. The program
+    // reads the pointer and then the string, so both the value and what it points at
+    // have to land where the assembler said they would.
+    try expectSourceOutput(
+        \\entry main
+        \\main:
+        \\  push greeting
+        \\  load32
+        \\  print_string
+        \\  halt
+        \\message:
+        \\  asciiz "hi"
+        \\greeting:
+        \\  i32 message
+    ,
+        "hi\n",
+    );
+}
+
+test "a narrow value keeps its bits and the load decides its sign" {
+    // `i8 -1` writes one byte. What that byte means is the business of the
+    // instruction that reads it, which is the difference between `signed char` and
+    // `unsigned char`.
+    try expectSourceOutput(
+        \\entry main
+        \\main:
+        \\  push small
+        \\  load8_s
+        \\  print
+        \\  pop
+        \\  push small
+        \\  load8_u
+        \\  print
+        \\  pop
+        \\  push wide
+        \\  load16_s
+        \\  print
+        \\  halt
+        \\small:
+        \\  i8 -1
+        \\wide:
+        \\  i16 -2
+    ,
+        "-1\n255\n-2\n",
+    );
+}
+
 test "a store into the code region is refused" {
     // Address 0 is the first byte of the code. A program that could write there
     // would make the work of the verifier meaningless, because the bytes it checked
