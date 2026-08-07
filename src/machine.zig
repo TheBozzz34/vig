@@ -8,6 +8,8 @@ const container = bytecode.container;
 const verify = bytecode.verify;
 const Io = std.Io;
 
+const ExecutionAbi = enum { vig32, vig64 };
+
 /// What the VM must remember about one active call.
 ///
 /// A `call` makes one of these. An `enter` in the called function then fills in the
@@ -75,6 +77,11 @@ pub const VM = struct {
 
     // The evaluation stack.
     stack: []i32,
+    /// VIG64 has a separate eight-byte operand stack. Keeping the VIG32 stack
+    /// separate means old raw bytecode and V3 containers retain their exact
+    /// signed 32-bit behaviour.
+    wide_stack: []u64,
+    execution_abi: ExecutionAbi = .vig32,
 
     // The call stack for the `call` and `ret` instructions.
     call_stack: []CallFrame,
@@ -89,6 +96,8 @@ pub const VM = struct {
 
     foreign_imports: [bytecode.foreign.max_imports]?foreign.Import,
     foreign_import_count: usize,
+    wide_foreign_imports: []?foreign.Vig64Import,
+    wide_foreign_import_count: usize,
 
     // The number of bytes of executable instructions at the start of the memory.
     // Execution and each jump target must stay inside this length.
@@ -135,7 +144,9 @@ pub const VM = struct {
     // the sizes that `init` gave them.
     pub fn reset(self: *VM) void {
         self.clearForeignImports();
+        self.clearWideForeignImports();
         @memset(self.stack, 0);
+        @memset(self.wide_stack, 0);
         @memset(self.memory, 0);
         @memset(self.call_stack, empty_frame);
         // The marks belong to the program that made them. `call_indirect` reads them
@@ -148,6 +159,7 @@ pub const VM = struct {
         self.verification_failure = null;
         self.ip = 0;
         self.sp = 0;
+        self.execution_abi = .vig32;
         self.csp = 0;
         // No function has a frame, so frame memory has used nothing. It grows down
         // from the end of memory as each `enter` runs.
@@ -157,8 +169,11 @@ pub const VM = struct {
     /// Give back the memory and the stacks, and release every foreign library.
     pub fn deinit(self: *VM) void {
         self.clearForeignImports();
+        self.clearWideForeignImports();
         self.allocator.free(self.memory);
         self.allocator.free(self.stack);
+        self.allocator.free(self.wide_stack);
+        self.allocator.free(self.wide_foreign_imports);
         self.allocator.free(self.call_stack);
         self.allocator.free(self.verify_scratch);
         self.* = undefined;
@@ -183,22 +198,32 @@ pub const VM = struct {
         errdefer allocator.free(memory);
         const stack = try allocator.alloc(i32, config.stack_size);
         errdefer allocator.free(stack);
+        const wide_stack = try allocator.alloc(u64, config.stack_size);
+        errdefer allocator.free(wide_stack);
+        const wide_foreign_imports = try allocator.alloc(?foreign.Vig64Import, bytecode.foreign.max_imports);
+        errdefer allocator.free(wide_foreign_imports);
         const call_stack = try allocator.alloc(CallFrame, config.call_stack_size);
         errdefer allocator.free(call_stack);
 
         @memset(memory, 0);
         @memset(stack, 0);
+        @memset(wide_stack, 0);
+        @memset(wide_foreign_imports, null);
         @memset(call_stack, empty_frame);
 
         self.* = .{
             .allocator = allocator,
             .memory = memory,
             .stack = stack,
+            .wide_stack = wide_stack,
+            .execution_abi = .vig32,
             .call_stack = call_stack,
             .csp = 0,
             .frame_pointer = config.memory_size,
             .foreign_imports = @splat(null),
             .foreign_import_count = 0,
+            .wide_foreign_imports = wide_foreign_imports,
+            .wide_foreign_import_count = 0,
             .code_len = 0,
             .program_len = 0,
             .verification_failure = null,
@@ -220,6 +245,10 @@ pub const VM = struct {
     pub fn loadProgram(self: *VM, program: []const u8) !void {
         self.reset();
         errdefer self.clearForeignImports();
+
+        if (container.isContainer(program) and program.len > 4 and program[4] == container.vig64_version) {
+            return self.loadVig64Program(program);
+        }
 
         const image = try container.parse(program);
 
@@ -254,8 +283,22 @@ pub const VM = struct {
         self.ip = image.header.entry_point;
     }
 
+    fn loadVig64Program(self: *VM, program: []const u8) !void {
+        const image = try container.parseVig64(program);
+        if (image.imageLen() > self.memory.len) return error.ProgramTooLarge;
+        if (image.header.entry_point > std.math.maxInt(usize)) return error.ProgramTooLarge;
+        try self.loadWideForeignImports(image);
+        @memcpy(self.memory[0..image.code.len], image.code);
+        @memcpy(self.memory[image.code.len..][0..image.data.len], image.data);
+        self.code_len = image.code.len;
+        self.program_len = @intCast(image.imageLen());
+        self.ip = @intCast(image.header.entry_point);
+        self.execution_abi = .vig64;
+    }
+
     // Read each instruction in the memory. Decode it, then execute it.
     pub fn run(self: *VM) !void {
+        if (self.execution_abi == .vig64) return self.runVig64();
         while (self.ip < self.code_len) {
             // Read the next instruction.
             const raw_op = self.memory[self.ip];
@@ -725,8 +768,757 @@ pub const VM = struct {
                 .store8 => try self.storeTo(u8),
                 .store16 => try self.storeTo(u16),
                 .store32 => try self.storeTo(u32),
+
+                // These instructions require the VIG64 value stack and VIG64
+                // container. They are listed here now so a VIG32 VM fails with
+                // a defined error instead of treating their bytes as unknown.
+                .push64,
+                .load64,
+                .store64,
+                .load64_at,
+                .store64_at,
+                .add64,
+                .sub64,
+                .mul64,
+                .div64,
+                .mod64,
+                .eq64,
+                .ne64,
+                .lt64,
+                .lte64,
+                .gt64,
+                .gte64,
+                .lt64_u,
+                .lte64_u,
+                .gt64_u,
+                .gte64_u,
+                .div64_u,
+                .mod64_u,
+                .and64,
+                .or64,
+                .xor64,
+                .not64,
+                .shl64,
+                .shr64_u,
+                .shr64_s,
+                .rotl64,
+                .add64_wrap,
+                .sub64_wrap,
+                .mul64_wrap,
+                .dadd,
+                .dsub,
+                .dmul,
+                .ddiv,
+                .dneg,
+                .dsqrt,
+                .deq,
+                .dne,
+                .dlt,
+                .dle,
+                .dgt,
+                .dge,
+                .d2i,
+                .d2u,
+                .d2l,
+                .d2ul,
+                .i2d,
+                .u2d,
+                .l2d,
+                .ul2d,
+                .f2d,
+                .d2f,
+                .jmp64,
+                .jmp_zero64,
+                .jmp_not_zero64,
+                .call64,
+                => return error.UnsupportedInstruction,
             }
         }
+    }
+
+    /// Execute the VIG64 core instruction set. VIG32 instructions that a C
+    /// `int` needs keep their 32-bit low-word rules on this wider stack.
+    fn runVig64(self: *VM) !void {
+        while (self.ip < self.code_len) {
+            const op = bytecode.OpCode.fromByte(self.memory[self.ip]) catch return error.InvalidInstruction;
+            self.ip += 1;
+            switch (op) {
+                .halt => return,
+                .push => {
+                    if (self.code_len - self.ip < 4) return error.SegmentFault;
+                    const value = std.mem.readInt(i32, self.memory[self.ip..][0..4], .little);
+                    self.ip += 4;
+                    try self.pushWide(@bitCast(@as(i64, value)));
+                },
+                .push64 => {
+                    if (self.code_len - self.ip < 8) return error.SegmentFault;
+                    const value = std.mem.readInt(i64, self.memory[self.ip..][0..8], .little);
+                    self.ip += 8;
+                    try self.pushWide(@bitCast(value));
+                },
+                .add => try self.wideNarrowBinary(std.math.add),
+                .sub => try self.wideNarrowBinary(std.math.sub),
+                .mul => try self.wideNarrowBinary(std.math.mul),
+                .add_wrap => try self.wideNarrowWrap(.add),
+                .sub_wrap => try self.wideNarrowWrap(.sub),
+                .mul_wrap => try self.wideNarrowWrap(.mul),
+                .div => try self.wideNarrowDivide(false, false),
+                .mod => try self.wideNarrowDivide(false, true),
+                .div_u => try self.wideNarrowDivide(true, false),
+                .mod_u => try self.wideNarrowDivide(true, true),
+                .eq => try self.wideNarrowCompare(.eq, false),
+                .ne => try self.wideNarrowCompare(.ne, false),
+                .lt => try self.wideNarrowCompare(.lt, false),
+                .lte => try self.wideNarrowCompare(.lte, false),
+                .gt => try self.wideNarrowCompare(.gt, false),
+                .gte => try self.wideNarrowCompare(.gte, false),
+                .lt_u => try self.wideNarrowCompare(.lt, true),
+                .lte_u => try self.wideNarrowCompare(.lte, true),
+                .gt_u => try self.wideNarrowCompare(.gt, true),
+                .gte_u => try self.wideNarrowCompare(.gte, true),
+                .print => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    try self.output.print("{d}\n", .{try self.peekNarrow()});
+                },
+                .print_hex => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    try self.output.print("{x:0>8}\n", .{@as(u32, @bitCast(try self.peekNarrow()))});
+                },
+                // A VIG64 string pointer is a whole 64-bit slot, so the address
+                // is not narrowed first. The instruction leaves it in place, as
+                // the VIG32 form does.
+                .print_string => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    const string = try self.wideGuestCString(self.wide_stack[self.sp - 1]);
+                    try self.output.print("{s}\n", .{string});
+                },
+                .read_i32 => {
+                    // Do not consume input when there is nowhere to put the
+                    // result.
+                    if (self.sp >= self.wide_stack.len) return error.StackOverflow;
+                    try self.pushNarrow(try self.readI32());
+                },
+                .read_byte => {
+                    // EOF is data for this instruction rather than a trap, so
+                    // a program can loop until it sees -1.
+                    if (self.sp >= self.wide_stack.len) return error.StackOverflow;
+                    try self.output.flush();
+                    const byte = self.input.takeByte() catch |err| switch (err) {
+                        error.EndOfStream => return self.pushNarrow(-1),
+                        error.ReadFailed => return error.InputReadFailed,
+                    };
+                    try self.pushNarrow(byte);
+                },
+                .write_byte => {
+                    const byte: u8 = @truncate(try self.popWide());
+                    try self.output.writeAll(&[_]u8{byte});
+                },
+                .@"and" => try self.wideNarrowBits(.and_op),
+                .@"or" => try self.wideNarrowBits(.or_op),
+                .xor => try self.wideNarrowBits(.xor_op),
+                .not => {
+                    const value: u32 = @bitCast(try self.popNarrow());
+                    try self.pushNarrow(@bitCast(~value));
+                },
+                .shl => try self.wideNarrowShift(.left),
+                .shr_u => try self.wideNarrowShift(.right_unsigned),
+                .shr_s => try self.wideNarrowShift(.right_signed),
+                .rotl => try self.wideNarrowShift(.rotate_left),
+                .jmp => try self.wideJump32(null),
+                .jmp_zero => try self.wideJump32(false),
+                .jmp_not_zero => try self.wideJump32(true),
+                .load => {
+                    if (self.code_len - self.ip < 4) return error.SegmentFault;
+                    const address = std.mem.readInt(u32, self.memory[self.ip..][0..4], .little);
+                    self.ip += 4;
+                    const at = try self.checkAccess(address, 4, .read);
+                    try self.pushNarrow(std.mem.readInt(i32, self.memory[at..][0..4], .little));
+                },
+                .store => {
+                    if (self.code_len - self.ip < 4) return error.SegmentFault;
+                    const address = std.mem.readInt(u32, self.memory[self.ip..][0..4], .little);
+                    self.ip += 4;
+                    const value = try self.popNarrow();
+                    const at = try self.checkAccess(address, 4, .write);
+                    std.mem.writeInt(i32, self.memory[at..][0..4], value, .little);
+                },
+                .load_at, .load32 => try self.wideLoadNarrow(),
+                .store_at, .store32 => try self.wideStoreNarrow(),
+                .load8_u => try self.wideLoad8(false),
+                .load8_s => try self.wideLoad8(true),
+                .load16_u => try self.wideLoad16(false),
+                .load16_s => try self.wideLoad16(true),
+                .store8 => try self.wideStore8(),
+                .store16 => try self.wideStore16(),
+                .pop => _ = try self.popWide(),
+                .dup => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    try self.pushWide(self.wide_stack[self.sp - 1]);
+                },
+                .swap => {
+                    if (self.sp < 2) return error.StackUnderflow;
+                    const top = self.wide_stack[self.sp - 1];
+                    self.wide_stack[self.sp - 1] = self.wide_stack[self.sp - 2];
+                    self.wide_stack[self.sp - 2] = top;
+                },
+                .call => {
+                    if (self.code_len - self.ip < 4) return error.SegmentFault;
+                    const target = std.mem.readInt(u32, self.memory[self.ip..][0..4], .little);
+                    self.ip += 4;
+                    try self.wideCall(target);
+                },
+                .call64 => {
+                    if (self.code_len - self.ip < 8) return error.SegmentFault;
+                    const target = std.mem.readInt(u64, self.memory[self.ip..][0..8], .little);
+                    self.ip += 8;
+                    try self.wideCall(target);
+                },
+                .call_indirect => try self.wideCall(try self.popWide()),
+                .jmp_indirect => try self.wideSetJump(try self.popWide()),
+                .ret => try self.wideReturn(false),
+                .ret_val => try self.wideReturn(true),
+                .enter => {
+                    if (self.code_len - self.ip < 4) return error.SegmentFault;
+                    const shape: bytecode.encode.FrameShape = .{
+                        .arguments = std.mem.readInt(u16, self.memory[self.ip..][0..2], .little),
+                        .locals = std.mem.readInt(u16, self.memory[self.ip + 2 ..][0..2], .little),
+                    };
+                    self.ip += 4;
+                    try self.enterWideFrame(shape);
+                },
+                .load_local => {
+                    if (self.code_len - self.ip < 2) return error.SegmentFault;
+                    const index = std.mem.readInt(u16, self.memory[self.ip..][0..2], .little);
+                    self.ip += 2;
+                    const at = try self.wideLocalAddress(index);
+                    try self.pushWide(std.mem.readInt(u64, self.memory[at..][0..8], .little));
+                },
+                .store_local => {
+                    if (self.code_len - self.ip < 2) return error.SegmentFault;
+                    const index = std.mem.readInt(u16, self.memory[self.ip..][0..2], .little);
+                    self.ip += 2;
+                    const value = try self.popWide();
+                    const at = try self.wideLocalAddress(index);
+                    std.mem.writeInt(u64, self.memory[at..][0..8], value, .little);
+                },
+                .local_addr => {
+                    if (self.code_len - self.ip < 2) return error.SegmentFault;
+                    const index = std.mem.readInt(u16, self.memory[self.ip..][0..2], .little);
+                    self.ip += 2;
+                    try self.pushWide(try self.wideLocalAddress(index));
+                },
+                .foreign_call => {
+                    if (self.ip >= self.code_len) return error.SegmentFault;
+                    const index = self.memory[self.ip];
+                    self.ip += 1;
+                    try self.callWideForeign(index);
+                },
+                .fadd => try self.wideFloatBinary(.add),
+                .fsub => try self.wideFloatBinary(.sub),
+                .fmul => try self.wideFloatBinary(.mul),
+                .fdiv => try self.wideFloatBinary(.div),
+                .fneg => {
+                    const value: f32 = @bitCast(@as(u32, @truncate(try self.popWide())));
+                    try self.pushWide(@as(u32, @bitCast(-value)));
+                },
+                .fsqrt => {
+                    const value: f32 = @bitCast(@as(u32, @truncate(try self.popWide())));
+                    try self.pushWide(@as(u32, @bitCast(@sqrt(value))));
+                },
+                .feq => try self.wideFloatCompare(.eq),
+                .fne => try self.wideFloatCompare(.ne),
+                .flt => try self.wideFloatCompare(.lt),
+                .fle => try self.wideFloatCompare(.lte),
+                .fgt => try self.wideFloatCompare(.gt),
+                .fge => try self.wideFloatCompare(.gte),
+                .f2i => {
+                    const value: f32 = @bitCast(@as(u32, @truncate(try self.popWide())));
+                    try self.pushNarrow(try floatToInt(i32, value));
+                },
+                .f2u => {
+                    const value: f32 = @bitCast(@as(u32, @truncate(try self.popWide())));
+                    try self.pushWide(@as(u32, @bitCast(try floatToInt(u32, value))));
+                },
+                .i2f => try self.wideNarrowToFloat(false),
+                .u2f => try self.wideNarrowToFloat(true),
+                .add64 => try self.wideSignedBinary(std.math.add),
+                .sub64 => try self.wideSignedBinary(std.math.sub),
+                .mul64 => try self.wideSignedBinary(std.math.mul),
+                .add64_wrap => try self.wideUnsignedBinary(.add),
+                .sub64_wrap => try self.wideUnsignedBinary(.sub),
+                .mul64_wrap => try self.wideUnsignedBinary(.mul),
+                .div64 => try self.wideSignedDivide(false),
+                .mod64 => try self.wideSignedDivide(true),
+                .div64_u => try self.wideUnsignedDivide(false),
+                .mod64_u => try self.wideUnsignedDivide(true),
+                .eq64 => try self.wideCompare(.eq),
+                .ne64 => try self.wideCompare(.ne),
+                .lt64 => try self.wideCompare(.lt),
+                .lte64 => try self.wideCompare(.lte),
+                .gt64 => try self.wideCompare(.gt),
+                .gte64 => try self.wideCompare(.gte),
+                .lt64_u => try self.wideUnsignedCompare(.lt),
+                .lte64_u => try self.wideUnsignedCompare(.lte),
+                .gt64_u => try self.wideUnsignedCompare(.gt),
+                .gte64_u => try self.wideUnsignedCompare(.gte),
+                .and64 => try self.wideBits(.and_op),
+                .or64 => try self.wideBits(.or_op),
+                .xor64 => try self.wideBits(.xor_op),
+                .not64 => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    self.wide_stack[self.sp - 1] = ~self.wide_stack[self.sp - 1];
+                },
+                .shl64 => try self.wideShift(.left),
+                .shr64_u => try self.wideShift(.right_unsigned),
+                .shr64_s => try self.wideShift(.right_signed),
+                .rotl64 => try self.wideShift(.rotate_left),
+                .load64_at => try self.wideLoad64(),
+                .store64_at => try self.wideStore64(),
+                .load64 => {
+                    if (self.code_len - self.ip < 8) return error.SegmentFault;
+                    const address = std.mem.readInt(u64, self.memory[self.ip..][0..8], .little);
+                    self.ip += 8;
+                    const at = try self.wideMemoryAddress(address, 8, .read);
+                    try self.pushWide(std.mem.readInt(u64, self.memory[at..][0..8], .little));
+                },
+                .store64 => {
+                    if (self.code_len - self.ip < 8) return error.SegmentFault;
+                    const address = std.mem.readInt(u64, self.memory[self.ip..][0..8], .little);
+                    self.ip += 8;
+                    const value = try self.popWide();
+                    const at = try self.wideMemoryAddress(address, 8, .write);
+                    std.mem.writeInt(u64, self.memory[at..][0..8], value, .little);
+                },
+                .dadd => try self.wideDoubleBinary(.add),
+                .dsub => try self.wideDoubleBinary(.sub),
+                .dmul => try self.wideDoubleBinary(.mul),
+                .ddiv => try self.wideDoubleBinary(.div),
+                .dneg => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    self.wide_stack[self.sp - 1] = @bitCast(-@as(f64, @bitCast(self.wide_stack[self.sp - 1])));
+                },
+                .dsqrt => {
+                    if (self.sp == 0) return error.StackUnderflow;
+                    self.wide_stack[self.sp - 1] = @bitCast(@sqrt(@as(f64, @bitCast(self.wide_stack[self.sp - 1]))));
+                },
+                .deq => try self.wideDoubleCompare(.eq),
+                .dne => try self.wideDoubleCompare(.ne),
+                .dlt => try self.wideDoubleCompare(.lt),
+                .dle => try self.wideDoubleCompare(.lte),
+                .dgt => try self.wideDoubleCompare(.gt),
+                .dge => try self.wideDoubleCompare(.gte),
+                .d2i => try self.wideDoubleToInteger(i32),
+                .d2u => try self.wideDoubleToInteger(u32),
+                .d2l => try self.wideDoubleToInteger(i64),
+                .d2ul => try self.wideDoubleToInteger(u64),
+                .i2d => try self.wideIntegerToDouble(i32),
+                .u2d => try self.wideIntegerToDouble(u32),
+                .l2d => try self.wideIntegerToDouble(i64),
+                .ul2d => try self.wideIntegerToDouble(u64),
+                .f2d => {
+                    const value: f32 = @bitCast(@as(u32, @truncate(try self.popWide())));
+                    try self.pushWide(@bitCast(@as(f64, value)));
+                },
+                .d2f => {
+                    const value: f64 = @bitCast(try self.popWide());
+                    try self.pushWide(@as(u32, @bitCast(@as(f32, @floatCast(value)))));
+                },
+                .jmp64 => try self.wideJump64(null),
+                .jmp_zero64 => try self.wideJump64(false),
+                .jmp_not_zero64 => try self.wideJump64(true),
+            }
+        }
+        return error.SegmentFault;
+    }
+
+    fn pushWide(self: *VM, value: u64) !void {
+        if (self.sp >= self.wide_stack.len) return error.StackOverflow;
+        self.wide_stack[self.sp] = value;
+        self.sp += 1;
+    }
+
+    fn pushNarrow(self: *VM, value: i32) !void {
+        try self.pushWide(@bitCast(@as(i64, value)));
+    }
+
+    fn popNarrow(self: *VM) !i32 {
+        const bits: u32 = @truncate(try self.popWide());
+        return @bitCast(bits);
+    }
+
+    fn peekNarrow(self: *const VM) !i32 {
+        if (self.sp == 0) return error.StackUnderflow;
+        const bits: u32 = @truncate(self.wide_stack[self.sp - 1]);
+        return @bitCast(bits);
+    }
+
+    fn popWide(self: *VM) !u64 {
+        if (self.sp == 0) return error.StackUnderflow;
+        self.sp -= 1;
+        return self.wide_stack[self.sp];
+    }
+
+    fn wideSignedBinary(self: *VM, comptime operation: anytype) !void {
+        const b: i64 = @bitCast(try self.popWide());
+        const a: i64 = @bitCast(try self.popWide());
+        const value = operation(i64, a, b) catch return error.IntegerOverflow;
+        try self.pushWide(@bitCast(value));
+    }
+
+    fn wideNarrowBinary(self: *VM, comptime operation: anytype) !void {
+        const b = try self.popNarrow();
+        const a = try self.popNarrow();
+        const value = operation(i32, a, b) catch return error.IntegerOverflow;
+        try self.pushNarrow(value);
+    }
+
+    fn wideNarrowWrap(self: *VM, comptime operation: enum { add, sub, mul }) !void {
+        const b: u32 = @bitCast(try self.popNarrow());
+        const a: u32 = @bitCast(try self.popNarrow());
+        const value: u32 = switch (operation) {
+            .add => a +% b,
+            .sub => a -% b,
+            .mul => a *% b,
+        };
+        try self.pushNarrow(@bitCast(value));
+    }
+
+    fn wideNarrowDivide(self: *VM, unsigned: bool, remainder: bool) !void {
+        if (unsigned) {
+            const b: u32 = @bitCast(try self.popNarrow());
+            const a: u32 = @bitCast(try self.popNarrow());
+            if (b == 0) return error.DivisionByZero;
+            try self.pushNarrow(@bitCast(if (remainder) a % b else a / b));
+        } else {
+            const b = try self.popNarrow();
+            const a = try self.popNarrow();
+            if (b == 0) return error.DivisionByZero;
+            if (a == std.math.minInt(i32) and b == -1) return error.IntegerOverflow;
+            try self.pushNarrow(if (remainder) @rem(a, b) else @divTrunc(a, b));
+        }
+    }
+
+    fn wideNarrowCompare(self: *VM, comptime operation: enum { eq, ne, lt, lte, gt, gte }, unsigned: bool) !void {
+        const b = try self.popNarrow();
+        const a = try self.popNarrow();
+        const result = if (unsigned) blk: {
+            const au: u32 = @bitCast(a);
+            const bu: u32 = @bitCast(b);
+            break :blk switch (operation) {
+                .eq => au == bu,
+                .ne => au != bu,
+                .lt => au < bu,
+                .lte => au <= bu,
+                .gt => au > bu,
+                .gte => au >= bu,
+            };
+        } else switch (operation) {
+            .eq => a == b,
+            .ne => a != b,
+            .lt => a < b,
+            .lte => a <= b,
+            .gt => a > b,
+            .gte => a >= b,
+        };
+        try self.pushWide(@intFromBool(result));
+    }
+
+    fn wideNarrowBits(self: *VM, comptime operation: enum { and_op, or_op, xor_op }) !void {
+        const b: u32 = @bitCast(try self.popNarrow());
+        const a: u32 = @bitCast(try self.popNarrow());
+        const value = switch (operation) {
+            .and_op => a & b,
+            .or_op => a | b,
+            .xor_op => a ^ b,
+        };
+        try self.pushNarrow(@bitCast(value));
+    }
+
+    fn wideNarrowShift(self: *VM, comptime operation: enum { left, right_unsigned, right_signed, rotate_left }) !void {
+        const count: u5 = @truncate(try self.popWide());
+        const value: u32 = @bitCast(try self.popNarrow());
+        const result: u32 = switch (operation) {
+            .left => value << count,
+            .right_unsigned => value >> count,
+            .right_signed => @bitCast(@as(i32, @bitCast(value)) >> count),
+            .rotate_left => std.math.rotl(u32, value, count),
+        };
+        try self.pushNarrow(@bitCast(result));
+    }
+
+    fn wideJump32(self: *VM, condition: ?bool) !void {
+        if (self.code_len - self.ip < 4) return error.SegmentFault;
+        const target = std.mem.readInt(u32, self.memory[self.ip..][0..4], .little);
+        self.ip += 4;
+        if (condition) |wanted| {
+            const value = try self.popWide();
+            if ((value != 0) != wanted) return;
+        }
+        if (target >= self.code_len) return error.SegmentFault;
+        self.ip = target;
+    }
+
+    fn wideJump64(self: *VM, condition: ?bool) !void {
+        if (self.code_len - self.ip < 8) return error.SegmentFault;
+        const target = std.mem.readInt(u64, self.memory[self.ip..][0..8], .little);
+        self.ip += 8;
+        if (condition) |wanted| {
+            const value = try self.popWide();
+            if ((value != 0) != wanted) return;
+        }
+        try self.wideSetJump(target);
+    }
+
+    fn wideSetJump(self: *VM, target: u64) !void {
+        const at = std.math.cast(usize, target) orelse return error.SegmentFault;
+        if (at >= self.code_len) return error.SegmentFault;
+        self.ip = at;
+    }
+
+    fn wideLoadNarrow(self: *VM) !void {
+        const address = try self.popWide();
+        const at = try self.wideMemoryAddress(address, 4, .read);
+        try self.pushNarrow(std.mem.readInt(i32, self.memory[at..][0..4], .little));
+    }
+
+    fn wideStoreNarrow(self: *VM) !void {
+        const address = try self.popWide();
+        const value = try self.popNarrow();
+        const at = try self.wideMemoryAddress(address, 4, .write);
+        std.mem.writeInt(i32, self.memory[at..][0..4], value, .little);
+    }
+
+    fn wideLoad8(self: *VM, signed: bool) !void {
+        const at = try self.wideMemoryAddress(try self.popWide(), 1, .read);
+        if (signed) {
+            const value: i8 = @bitCast(self.memory[at]);
+            try self.pushWide(@bitCast(@as(i64, value)));
+        } else try self.pushWide(self.memory[at]);
+    }
+
+    fn wideLoad16(self: *VM, signed: bool) !void {
+        const at = try self.wideMemoryAddress(try self.popWide(), 2, .read);
+        const bits = std.mem.readInt(u16, self.memory[at..][0..2], .little);
+        if (signed) try self.pushWide(@bitCast(@as(i64, @as(i16, @bitCast(bits))))) else try self.pushWide(bits);
+    }
+
+    fn wideStore8(self: *VM) !void {
+        const address = try self.popWide();
+        const value: u8 = @truncate(try self.popWide());
+        const at = try self.wideMemoryAddress(address, 1, .write);
+        self.memory[at] = value;
+    }
+
+    fn wideStore16(self: *VM) !void {
+        const address = try self.popWide();
+        const value: u16 = @truncate(try self.popWide());
+        const at = try self.wideMemoryAddress(address, 2, .write);
+        std.mem.writeInt(u16, self.memory[at..][0..2], value, .little);
+    }
+
+    fn wideUnsignedBinary(self: *VM, comptime operation: enum { add, sub, mul }) !void {
+        const b = try self.popWide();
+        const a = try self.popWide();
+        try self.pushWide(switch (operation) {
+            .add => a +% b,
+            .sub => a -% b,
+            .mul => a *% b,
+        });
+    }
+
+    fn wideSignedDivide(self: *VM, remainder: bool) !void {
+        const b: i64 = @bitCast(try self.popWide());
+        const a: i64 = @bitCast(try self.popWide());
+        if (b == 0) return error.DivisionByZero;
+        if (a == std.math.minInt(i64) and b == -1) return error.IntegerOverflow;
+        try self.pushWide(@bitCast(if (remainder) @rem(a, b) else @divTrunc(a, b)));
+    }
+
+    fn wideUnsignedDivide(self: *VM, remainder: bool) !void {
+        const b = try self.popWide();
+        const a = try self.popWide();
+        if (b == 0) return error.DivisionByZero;
+        try self.pushWide(if (remainder) a % b else a / b);
+    }
+
+    fn wideCompare(self: *VM, comptime operation: enum { eq, ne, lt, lte, gt, gte }) !void {
+        const b: i64 = @bitCast(try self.popWide());
+        const a: i64 = @bitCast(try self.popWide());
+        try self.pushWide(@intFromBool(switch (operation) {
+            .eq => a == b,
+            .ne => a != b,
+            .lt => a < b,
+            .lte => a <= b,
+            .gt => a > b,
+            .gte => a >= b,
+        }));
+    }
+
+    fn wideUnsignedCompare(self: *VM, comptime operation: enum { lt, lte, gt, gte }) !void {
+        const b = try self.popWide();
+        const a = try self.popWide();
+        try self.pushWide(@intFromBool(switch (operation) {
+            .lt => a < b,
+            .lte => a <= b,
+            .gt => a > b,
+            .gte => a >= b,
+        }));
+    }
+
+    fn wideBits(self: *VM, comptime operation: enum { and_op, or_op, xor_op }) !void {
+        const b = try self.popWide();
+        const a = try self.popWide();
+        try self.pushWide(switch (operation) {
+            .and_op => a & b,
+            .or_op => a | b,
+            .xor_op => a ^ b,
+        });
+    }
+
+    fn wideShift(self: *VM, comptime operation: enum { left, right_unsigned, right_signed, rotate_left }) !void {
+        const count: u6 = @truncate(try self.popWide());
+        const value = try self.popWide();
+        const result: u64 = switch (operation) {
+            .left => value << count,
+            .right_unsigned => value >> count,
+            .right_signed => @bitCast(@as(i64, @bitCast(value)) >> count),
+            .rotate_left => std.math.rotl(u64, value, count),
+        };
+        try self.pushWide(result);
+    }
+
+    fn wideMemoryAddress(self: *const VM, address: u64, width: usize, access: Access) !usize {
+        const at = std.math.cast(usize, address) orelse return error.SegmentFault;
+        return self.checkAccess(at, width, access);
+    }
+
+    fn wideLoad64(self: *VM) !void {
+        const address = try self.popWide();
+        const at = try self.wideMemoryAddress(address, 8, .read);
+        try self.pushWide(std.mem.readInt(u64, self.memory[at..][0..8], .little));
+    }
+
+    fn wideStore64(self: *VM) !void {
+        const address = try self.popWide();
+        const value = try self.popWide();
+        const at = try self.wideMemoryAddress(address, 8, .write);
+        std.mem.writeInt(u64, self.memory[at..][0..8], value, .little);
+    }
+
+    fn wideDoubleBinary(self: *VM, comptime operation: enum { add, sub, mul, div }) !void {
+        const b: f64 = @bitCast(try self.popWide());
+        const a: f64 = @bitCast(try self.popWide());
+        const value = switch (operation) {
+            .add => a + b,
+            .sub => a - b,
+            .mul => a * b,
+            .div => a / b,
+        };
+        try self.pushWide(@bitCast(value));
+    }
+
+    fn wideFloatBinary(self: *VM, comptime operation: enum { add, sub, mul, div }) !void {
+        const b: f32 = @bitCast(@as(u32, @truncate(try self.popWide())));
+        const a: f32 = @bitCast(@as(u32, @truncate(try self.popWide())));
+        const value = switch (operation) {
+            .add => a + b,
+            .sub => a - b,
+            .mul => a * b,
+            .div => a / b,
+        };
+        try self.pushWide(@as(u32, @bitCast(value)));
+    }
+
+    fn wideFloatCompare(self: *VM, comptime operation: enum { eq, ne, lt, lte, gt, gte }) !void {
+        const b: f32 = @bitCast(@as(u32, @truncate(try self.popWide())));
+        const a: f32 = @bitCast(@as(u32, @truncate(try self.popWide())));
+        try self.pushWide(@intFromBool(switch (operation) {
+            .eq => a == b,
+            .ne => a != b,
+            .lt => a < b,
+            .lte => a <= b,
+            .gt => a > b,
+            .gte => a >= b,
+        }));
+    }
+
+    fn wideNarrowToFloat(self: *VM, unsigned: bool) !void {
+        const bits: u32 = @bitCast(try self.popNarrow());
+        const value: f32 = if (unsigned) @floatFromInt(bits) else @floatFromInt(@as(i32, @bitCast(bits)));
+        try self.pushWide(@as(u32, @bitCast(value)));
+    }
+
+    fn wideDoubleCompare(self: *VM, comptime operation: enum { eq, ne, lt, lte, gt, gte }) !void {
+        const b: f64 = @bitCast(try self.popWide());
+        const a: f64 = @bitCast(try self.popWide());
+        try self.pushWide(@intFromBool(switch (operation) {
+            .eq => a == b,
+            .ne => a != b,
+            .lt => a < b,
+            .lte => a <= b,
+            .gt => a > b,
+            .gte => a >= b,
+        }));
+    }
+
+    fn wideDoubleToInteger(self: *VM, comptime T: type) !void {
+        const value: f64 = @bitCast(try self.popWide());
+        const result = try doubleToInt(T, value);
+        if (T == i32) try self.pushNarrow(result) else if (T == u32) try self.pushWide(result) else if (T == i64) try self.pushWide(@bitCast(result)) else try self.pushWide(result);
+    }
+
+    fn wideIntegerToDouble(self: *VM, comptime T: type) !void {
+        const raw = try self.popWide();
+        const input: T = if (T == i32) @as(i32, @bitCast(@as(u32, @truncate(raw)))) else if (T == u32) @truncate(raw) else @bitCast(raw);
+        try self.pushWide(@bitCast(@as(f64, @floatFromInt(input))));
+    }
+
+    fn wideCall(self: *VM, target: u64) !void {
+        const at = std.math.cast(usize, target) orelse return error.SegmentFault;
+        if (at >= self.code_len) return error.SegmentFault;
+        if (self.csp >= self.call_stack.len) return error.CallStackOverflow;
+        self.call_stack[self.csp] = .{ .return_ip = self.ip, .operand_base = self.sp, .saved_frame_pointer = self.frame_pointer };
+        self.csp += 1;
+        self.ip = at;
+    }
+
+    fn enterWideFrame(self: *VM, shape: bytecode.encode.FrameShape) !void {
+        if (self.csp == 0) return error.EnterOutsideCall;
+        const frame = &self.call_stack[self.csp - 1];
+        if (frame.entered) return error.FrameAlreadyEntered;
+        const arguments: usize = shape.arguments;
+        if (self.sp < arguments) return error.StackUnderflow;
+        const size = @as(usize, shape.slots()) * 8;
+        if (size > self.frame_pointer or self.frame_pointer - size < self.program_len) return error.FrameMemoryExhausted;
+        const base = self.frame_pointer - size;
+        self.sp -= arguments;
+        for (0..arguments) |index| std.mem.writeInt(u64, self.memory[base + index * 8 ..][0..8], self.wide_stack[self.sp + index], .little);
+        @memset(self.memory[base + arguments * 8 .. base + size], 0);
+        frame.entered = true;
+        frame.frame_base = base;
+        frame.arguments = shape.arguments;
+        frame.locals = shape.locals;
+        self.frame_pointer = base;
+    }
+
+    fn wideReturn(self: *VM, with_value: bool) !void {
+        if (self.csp == 0) return error.CallStackUnderflow;
+        const value = if (with_value) try self.popWide() else 0;
+        self.csp -= 1;
+        const frame = self.call_stack[self.csp];
+        if (frame.entered) {
+            self.sp = frame.operand_base - frame.arguments;
+            if (with_value) try self.pushWide(value);
+        }
+        self.frame_pointer = frame.saved_frame_pointer;
+        self.ip = frame.return_ip;
+    }
+
+    fn wideLocalAddress(self: *const VM, index: u16) !usize {
+        if (self.csp == 0) return error.NoActiveFrame;
+        const frame = self.call_stack[self.csp - 1];
+        if (index >= frame.slots()) return error.LocalOutOfRange;
+        return frame.frame_base + @as(usize, index) * 8;
     }
 
     // Read one whitespace-delimited signed decimal integer. Output is flushed
@@ -991,6 +1783,14 @@ pub const VM = struct {
         self.foreign_import_count = 0;
     }
 
+    fn clearWideForeignImports(self: *VM) void {
+        for (self.wide_foreign_imports) |*entry| {
+            if (entry.*) |*import| foreign.closeVig64(import);
+            entry.* = null;
+        }
+        self.wide_foreign_import_count = 0;
+    }
+
     // Find the library address and the symbol address for each declaration in
     // the import table of the container. The container reader has already checked
     // the size of the table and the import count.
@@ -1006,6 +1806,78 @@ pub const VM = struct {
             );
             self.foreign_import_count += 1;
         }
+    }
+
+    fn loadWideForeignImports(self: *VM, image: container.Vig64Image) !void {
+        var iterator = image.importIterator();
+        while (try iterator.next()) |import| {
+            self.wide_foreign_imports[self.wide_foreign_import_count] = try foreign.resolveVig64(
+                import.library,
+                import.symbol,
+                import.result,
+                import.argTypes(),
+            );
+            self.wide_foreign_import_count += 1;
+        }
+    }
+
+    fn callWideForeign(self: *VM, import_index: u8) !void {
+        const index: usize = import_index;
+        if (index >= self.wide_foreign_import_count) return error.InvalidForeignImport;
+        const import = &(self.wide_foreign_imports[index] orelse return error.InvalidForeignImport);
+        const count: usize = import.arg_count;
+        if (self.sp < count) return error.StackUnderflow;
+        var args: [bytecode.foreign.vig64_max_args]foreign.Vig64Value = undefined;
+        var position = count;
+        while (position > 0) {
+            position -= 1;
+            args[position] = try self.marshalWideForeignArgument(import.arg_types[position], try self.popWide());
+        }
+        try self.output.flush();
+        const result = try foreign.invokeVig64(import, args);
+        switch (import.result) {
+            .void => {},
+            .i32 => try self.pushNarrow(result.i32),
+            .u32 => try self.pushWide(result.u32),
+            .i64 => try self.pushWide(@bitCast(result.i64)),
+            .u64 => try self.pushWide(result.u64),
+            .guest_ptr, .host_ptr => try self.pushWide(if (result.ptr) |pointer| @intFromPtr(pointer) else 0),
+            .f32 => try self.pushWide(@as(u32, @bitCast(result.f32))),
+            .f64 => try self.pushWide(@bitCast(result.f64)),
+        }
+    }
+
+    fn marshalWideForeignArgument(self: *VM, kind: foreign.Vig64Type, value: u64) !foreign.Vig64Value {
+        return switch (kind) {
+            .i32 => .{ .i32 = @bitCast(@as(u32, @truncate(value))) },
+            .u32 => .{ .u32 = @truncate(value) },
+            .i64 => .{ .i64 = @bitCast(value) },
+            .u64 => .{ .u64 = value },
+            .f32 => .{ .f32 = @bitCast(@as(u32, @truncate(value))) },
+            .f64 => .{ .f64 = @bitCast(value) },
+            .guest_ptr => .{ .ptr = if (value == 0) null else @ptrFromInt(try self.wideGuestPointer(value)) },
+            .host_ptr => .{ .ptr = if (value == 0) null else @ptrFromInt(value) },
+        };
+    }
+
+    /// The bytes of a VIG64 guest string, without its terminator. The bound is
+    /// the program image, exactly as it is for a VIG32 string: see
+    /// `guestStringLimit`.
+    fn wideGuestCString(self: *const VM, value: u64) ![]const u8 {
+        if (value == 0) return error.InvalidGuestPointer;
+        const offset = std.math.cast(usize, value) orelse return error.InvalidGuestPointer;
+        const limit = self.guestStringLimit();
+        if (offset >= limit) return error.InvalidGuestPointer;
+
+        const bytes = self.memory[offset..limit];
+        const terminator = std.mem.indexOfScalar(u8, bytes, 0) orelse return error.UnterminatedGuestString;
+        return bytes[0..terminator];
+    }
+
+    fn wideGuestPointer(self: *VM, value: u64) !usize {
+        const offset = std.math.cast(usize, value) orelse return error.InvalidGuestPointer;
+        if (offset >= self.memory.len) return error.InvalidGuestPointer;
+        return @intFromPtr(self.memory[offset..].ptr);
     }
 
     /// The checks that the verifier makes for this program, in the form it takes
@@ -1380,8 +2252,99 @@ fn expectTrap(program: []const u8, expected_error: anyerror, expected_output: []
     try std.testing.expectEqualStrings(expected_output, harness.written());
 }
 
+/// The binary64 equivalent of `floatToInt`. C casts truncate toward zero and a
+/// NaN or an out-of-range value has no representable VM result.
+fn doubleToInt(comptime T: type, value: f64) !T {
+    const truncated = @trunc(value);
+    const limit: f64 = @floatFromInt(@as(i128, std.math.maxInt(T)) + 1);
+    const floor: f64 = if (std.math.minInt(T) == 0) 0.0 else -limit;
+    if (!(truncated >= floor and truncated < limit)) return error.InvalidFloatConversion;
+    return @intFromFloat(truncated);
+}
+
+test "a VIG64 container executes wide integer arithmetic" {
+    var code: [20]u8 = undefined;
+    code[0] = @backingInt(bytecode.OpCode.push64);
+    std.mem.writeInt(i64, code[1..9], 40, .little);
+    code[9] = @backingInt(bytecode.OpCode.push64);
+    std.mem.writeInt(i64, code[10..18], 2, .little);
+    code[18] = @backingInt(bytecode.OpCode.add64);
+    code[19] = @backingInt(bytecode.OpCode.halt);
+    var program: [128]u8 = undefined;
+    const size = try container.writeVig64(.{ .code = &code }, &program);
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    try harness.vm.loadProgram(program[0..size]);
+    try harness.vm.run();
+    try std.testing.expectEqual(ExecutionAbi.vig64, harness.vm.execution_abi);
+    try std.testing.expectEqual(@as(usize, 1), harness.vm.sp);
+    try std.testing.expectEqual(@as(u64, 42), harness.vm.wide_stack[0]);
+}
+
+test "a VIG64 container executes binary64 arithmetic" {
+    var code: [20]u8 = undefined;
+    code[0] = @backingInt(bytecode.OpCode.push64);
+    std.mem.writeInt(u64, code[1..9], @bitCast(@as(f64, 1.5)), .little);
+    code[9] = @backingInt(bytecode.OpCode.push64);
+    std.mem.writeInt(u64, code[10..18], @bitCast(@as(f64, 2.0)), .little);
+    code[18] = @backingInt(bytecode.OpCode.dmul);
+    code[19] = @backingInt(bytecode.OpCode.halt);
+    var program: [128]u8 = undefined;
+    const size = try container.writeVig64(.{ .code = &code }, &program);
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    try harness.vm.loadProgram(program[0..size]);
+    try harness.vm.run();
+    try std.testing.expectEqual(@as(f64, 3.0), @as(f64, @bitCast(harness.vm.wide_stack[0])));
+}
+
+test "a VIG64 container executes binary64 conversions and wide bit operations" {
+    var code: [31]u8 = undefined;
+    code[0] = @backingInt(bytecode.OpCode.push64);
+    std.mem.writeInt(u64, code[1..9], @bitCast(@as(f64, 42.75)), .little);
+    code[9] = @backingInt(bytecode.OpCode.d2l);
+    code[10] = @backingInt(bytecode.OpCode.push64);
+    std.mem.writeInt(u64, code[11..19], 0xf0, .little);
+    code[19] = @backingInt(bytecode.OpCode.push64);
+    std.mem.writeInt(u64, code[20..28], 0x0f, .little);
+    code[28] = @backingInt(bytecode.OpCode.@"or");
+    code[29] = @backingInt(bytecode.OpCode.or64);
+    code[30] = @backingInt(bytecode.OpCode.halt);
+    var program: [128]u8 = undefined;
+    const size = try container.writeVig64(.{ .code = &code }, &program);
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    try harness.vm.loadProgram(program[0..size]);
+    try harness.vm.run();
+    try std.testing.expectEqual(@as(u64, 0xff), harness.vm.wide_stack[0]);
+}
+
+test "a VIG64 container invokes a typed foreign import" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const import: bytecode.foreign.Vig64Import = .{
+        .library = "kernel32.dll",
+        .symbol = "GetCurrentProcessId",
+        .result = .u32,
+    };
+    const code = [_]u8{ @backingInt(bytecode.OpCode.foreign_call), 0, @backingInt(bytecode.OpCode.halt) };
+    var program: [128]u8 = undefined;
+    const size = try container.writeVig64(.{ .imports = &.{import}, .code = &code }, &program);
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    try harness.vm.loadProgram(program[0..size]);
+    try harness.vm.run();
+    try std.testing.expect(harness.vm.wide_stack[0] > 0);
+}
+
 fn opByte(code: bytecode.OpCode) u8 {
-    return @intFromEnum(code);
+    return @backingInt(code);
 }
 
 // Encode `push value`. This function keeps a test program easy to read.
@@ -1459,7 +2422,7 @@ test "execution stops at the loaded program boundary" {
     const vm = harness.vm;
 
     const program = [_]u8{
-        @intFromEnum(bytecode.OpCode.push),
+        @backingInt(bytecode.OpCode.push),
         1,
         0,
         0,
@@ -1657,9 +2620,9 @@ test "print_string prints a VIG-managed string and retains its address" {
     const vm = harness.vm;
 
     const program = [_]u8{
-        @intFromEnum(bytecode.OpCode.push),         7,                                  0,   0,   0,
-        @intFromEnum(bytecode.OpCode.print_string), @intFromEnum(bytecode.OpCode.halt), 'h', 'e', 'l',
-        'l',                                        'o',                                0,
+        @backingInt(bytecode.OpCode.push),         7,                                 0,   0,   0,
+        @backingInt(bytecode.OpCode.print_string), @backingInt(bytecode.OpCode.halt), 'h', 'e', 'l',
+        'l',                                       'o',                               0,
     };
     try vm.loadProgram(&program);
     try vm.run();
@@ -1675,7 +2638,7 @@ test "guest strings must be non-null and NUL-terminated within the program" {
     harness.start();
     const vm = harness.vm;
 
-    const program = [_]u8{ @intFromEnum(bytecode.OpCode.halt), 'x' };
+    const program = [_]u8{ @backingInt(bytecode.OpCode.halt), 'x' };
     try vm.loadProgram(&program);
     try std.testing.expectError(error.InvalidGuestPointer, vm.guestCString(0));
     try std.testing.expectError(error.UnterminatedGuestString, vm.guestCString(1));
@@ -2783,11 +3746,6 @@ test "a config that no VM can honour is refused" {
         .{ .config = .{ .memory_size = 0 }, .reason = error.ConfigTooSmall },
         .{ .config = .{ .stack_size = 0 }, .reason = error.ConfigTooSmall },
         .{ .config = .{ .call_stack_size = 0 }, .reason = error.ConfigTooSmall },
-        // A guest pointer is an `i32`, so no program could name a byte above this.
-        .{
-            .config = .{ .memory_size = Config.max_memory_size + 1 },
-            .reason = error.MemoryTooLarge,
-        },
     };
 
     for (cases) |case| {

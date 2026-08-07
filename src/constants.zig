@@ -1,3 +1,4 @@
+const std = @import("std");
 const bytecode = @import("vig_bytecode");
 
 /// The sizes that a VM is built with.
@@ -28,15 +29,12 @@ pub const Config = struct {
     /// The number of calls that can be active at one time.
     call_stack_size: usize = default_call_stack_size,
 
-    /// The largest memory that a VM can address.
-    ///
-    /// A guest pointer is a value on the operand stack, which holds an `i32`. A
-    /// negative address is a fault, so no program can name a byte at or above this
-    /// limit however large the memory is.
-    pub const max_memory_size: usize = 1 << 31;
+    /// The largest memory that this host process can address. VIG32 instructions
+    /// still use 32-bit operands, but VIG64 guest addresses are `u64` and the VM
+    /// must not impose the old two-gibibyte ABI limit before it checks an access.
+    pub const max_memory_size: usize = std.math.maxInt(usize);
 
     pub fn check(self: Config) error{ MemoryTooLarge, ConfigTooSmall }!void {
-        if (self.memory_size > max_memory_size) return error.MemoryTooLarge;
         // A VM with no memory can hold no program, and one with no stack can run no
         // instruction that produces a value.
         if (self.memory_size == 0 or self.stack_size == 0 or self.call_stack_size == 0) {

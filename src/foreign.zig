@@ -23,6 +23,8 @@ const ffi = @import("ffi");
 // module takes them from the shared package. It does not declare them again.
 const limits = bytecode.foreign;
 pub const ArgType = limits.ArgType;
+pub const Vig64Type = limits.Vig64Type;
+pub const Vig64ResultType = limits.Vig64ResultType;
 
 // A foreign import after the VM finds the addresses of its library and its
 // symbol. The declaration for this import is a `bytecode.foreign.Import`. The
@@ -32,6 +34,16 @@ pub const Import = struct {
     address: *const anyopaque,
     arg_count: u8,
     arg_types: [limits.max_args]ArgType,
+};
+
+/// A resolved VIG64 import. It shares only the opaque loader addresses with a
+/// VIG32 import; its type list and result type are the VIG64 ABI.
+pub const Vig64Import = struct {
+    library: *anyopaque,
+    address: *const anyopaque,
+    result: Vig64ResultType,
+    arg_count: u8,
+    arg_types: [limits.vig64_max_args]Vig64Type,
 };
 
 /// This value is true if a program on this system can make a foreign call. A
@@ -84,6 +96,73 @@ pub fn close(import: *Import) void {
 /// Call the foreign function and give its result.
 pub fn invoke(import: *const Import, args: [limits.max_args]usize) !u32 {
     return backend.invoke(import, args);
+}
+
+pub fn resolveVig64(library_name: []const u8, symbol_name: []const u8, result: Vig64ResultType, arg_types: []const Vig64Type) !Vig64Import {
+    if (arg_types.len > limits.vig64_max_args) return error.InvalidForeignImport;
+    // `resolve` already performs the platform-specific load and name checks.
+    // An empty VIG32 declaration is sufficient because the loader has no ABI
+    // type information; libffi receives the VIG64 types at invocation time.
+    const base = try resolve(library_name, symbol_name, &.{});
+    var types: [limits.vig64_max_args]Vig64Type = @splat(.u64);
+    @memcpy(types[0..arg_types.len], arg_types);
+    return .{ .library = base.library, .address = base.address, .result = result, .arg_count = @intCast(arg_types.len), .arg_types = types };
+}
+
+pub fn closeVig64(import: *Vig64Import) void {
+    var base: Import = .{ .library = import.library, .address = import.address, .arg_count = 0, .arg_types = @splat(.u32) };
+    close(&base);
+}
+
+pub const Vig64Value = extern union {
+    i32: i32,
+    u32: u32,
+    i64: i64,
+    u64: u64,
+    ptr: ?*anyopaque,
+    f32: f32,
+    f64: f64,
+};
+
+pub fn invokeVig64(import: *const Vig64Import, args: [limits.vig64_max_args]Vig64Value) !Vig64Value {
+    var cif: ffi.ffi_cif = undefined;
+    var types: [limits.vig64_max_args][*c]ffi.ffi_type = undefined;
+    var values = args;
+    var value_pointers: [limits.vig64_max_args]?*anyopaque = undefined;
+    for (0..import.arg_count) |index| {
+        const field = vig64FfiType(import.arg_types[index]);
+        types[index] = field;
+        value_pointers[index] = switch (import.arg_types[index]) {
+            .i32 => &values[index].i32, .u32 => &values[index].u32,
+            .i64 => &values[index].i64, .u64 => &values[index].u64,
+            .guest_ptr, .host_ptr => @ptrCast(&values[index].ptr),
+            .f32 => &values[index].f32, .f64 => &values[index].f64,
+        };
+    }
+    var result: Vig64Value = undefined;
+    const status = ffi.ffi_prep_cif(&cif, abi, import.arg_count, vig64ResultFfiType(import.result), &types);
+    if (status != ffi.FFI_OK) return error.ForeignCallPreparationFailed;
+    ffi.ffi_call(&cif, @ptrCast(@alignCast(import.address)), &result, &value_pointers);
+    return result;
+}
+
+fn vig64FfiType(kind: Vig64Type) [*c]ffi.ffi_type {
+    return switch (kind) {
+        .i32 => &ffi.ffi_type_sint32, .u32 => &ffi.ffi_type_uint32,
+        .i64 => &ffi.ffi_type_sint64, .u64 => &ffi.ffi_type_uint64,
+        .guest_ptr, .host_ptr => &ffi.ffi_type_pointer,
+        .f32 => &ffi.ffi_type_float, .f64 => &ffi.ffi_type_double,
+    };
+}
+
+fn vig64ResultFfiType(kind: Vig64ResultType) [*c]ffi.ffi_type {
+    return switch (kind) {
+        .void => &ffi.ffi_type_void,
+        .i32 => &ffi.ffi_type_sint32, .u32 => &ffi.ffi_type_uint32,
+        .i64 => &ffi.ffi_type_sint64, .u64 => &ffi.ffi_type_uint64,
+        .guest_ptr, .host_ptr => &ffi.ffi_type_pointer,
+        .f32 => &ffi.ffi_type_float, .f64 => &ffi.ffi_type_double,
+    };
 }
 
 // A system that has no foreign-call support. `resolve` refuses every declaration,
