@@ -26,7 +26,7 @@ pub const Stats = if (count_instructions) struct {
 
     fn record(self: *Stats, op: bytecode.OpCode) void {
         self.total += 1;
-        self.per_opcode[@intFromEnum(op)] += 1;
+        self.per_opcode[@backingInt(op)] += 1;
     }
 
     /// Write the report: the totals, then each opcode that ran, most first.
@@ -925,23 +925,37 @@ pub const VM = struct {
     /// Execute the VIG64 core instruction set. VIG32 instructions that a C
     /// `int` needs keep their 32-bit low-word rules on this wider stack.
     fn runVig64(self: *VM) !void {
-        while (self.ip < self.code_len) {
-            const op = bytecode.OpCode.fromByte(self.memory[self.ip]) catch return error.InvalidInstruction;
-            self.stats.record(op);
-            self.ip += 1;
-            switch (op) {
+        // A switch compiles to one indirect jump, which gives the branch predictor
+        // one history to work from: it learns what follows "some instruction", which
+        // is nothing worth knowing. A prong that ends in `continue :dispatch` gets
+        // its own jump instead, and therefore its own history — and what follows a
+        // `load_local32` is highly predictable.
+        //
+        // Only the instructions that a compiled program runs most have one. They are
+        // the ten at the top of a `--stats` report over `vigcc/bench`, which are 78%
+        // of everything it executes; the rest fall out of the switch and go round
+        // this loop, which is the one shared jump they share.
+        //
+        // Giving all 141 of them their own was measured and is worse. It spreads the
+        // branch-target buffer too thin: a byte loop gained 29% and a sort calling a
+        // comparator through a pointer paid 15%, for 4% overall against the 14% this
+        // gives. To revisit the list, profile and compare — see bench/README.md.
+        while (true) {
+            dispatch: switch (try self.nextVig64Instruction()) {
                 .halt => return,
                 .push => {
                     if (self.code_len - self.ip < 4) return error.SegmentFault;
                     const value = std.mem.readInt(i32, self.memory[self.ip..][0..4], .little);
                     self.ip += 4;
                     try self.pushWide(@bitCast(@as(i64, value)));
+                    continue :dispatch try self.nextVig64Instruction();
                 },
                 .push64 => {
                     if (self.code_len - self.ip < 8) return error.SegmentFault;
                     const value = std.mem.readInt(i64, self.memory[self.ip..][0..8], .little);
                     self.ip += 8;
                     try self.pushWide(@bitCast(value));
+                    continue :dispatch try self.nextVig64Instruction();
                 },
                 .add => try self.wideNarrowBinary(std.math.add),
                 .sub => try self.wideNarrowBinary(std.math.sub),
@@ -1032,10 +1046,16 @@ pub const VM = struct {
                 .load_at, .load32 => try self.wideLoadNarrow(),
                 .store_at, .store32 => try self.wideStoreNarrow(),
                 .load8_u => try self.wideLoad8(false),
-                .load8_s => try self.wideLoad8(true),
+                .load8_s => {
+                    try self.wideLoad8(true);
+                    continue :dispatch try self.nextVig64Instruction();
+                },
                 .load16_u => try self.wideLoad16(false),
                 .load16_s => try self.wideLoad16(true),
-                .store8 => try self.wideStore8(),
+                .store8 => {
+                    try self.wideStore8();
+                    continue :dispatch try self.nextVig64Instruction();
+                },
                 .store16 => try self.wideStore16(),
                 .pop => _ = try self.popWide(),
                 .dup => {
@@ -1079,6 +1099,7 @@ pub const VM = struct {
                     self.ip += 2;
                     const at = try self.wideLocalAddress(index);
                     try self.pushWide(std.mem.readInt(u64, self.memory[at..][0..8], .little));
+                    continue :dispatch try self.nextVig64Instruction();
                 },
                 // The four-byte slot, which is what a C `int' local is. The sign
                 // is extended so that the value means the same number as it would
@@ -1089,6 +1110,7 @@ pub const VM = struct {
                     self.ip += 2;
                     const at = try self.wideLocalAddress(index);
                     try self.pushNarrow(std.mem.readInt(i32, self.memory[at..][0..4], .little));
+                    continue :dispatch try self.nextVig64Instruction();
                 },
                 .store_local32 => {
                     if (self.code_len - self.ip < 2) return error.SegmentFault;
@@ -1097,6 +1119,7 @@ pub const VM = struct {
                     const value = try self.popNarrow();
                     const at = try self.wideLocalAddress(index);
                     std.mem.writeInt(i32, self.memory[at..][0..4], value, .little);
+                    continue :dispatch try self.nextVig64Instruction();
                 },
                 .store_local => {
                     if (self.code_len - self.ip < 2) return error.SegmentFault;
@@ -1105,6 +1128,7 @@ pub const VM = struct {
                     const value = try self.popWide();
                     const at = try self.wideLocalAddress(index);
                     std.mem.writeInt(u64, self.memory[at..][0..8], value, .little);
+                    continue :dispatch try self.nextVig64Instruction();
                 },
                 .local_addr => {
                     if (self.code_len - self.ip < 2) return error.SegmentFault;
@@ -1146,7 +1170,10 @@ pub const VM = struct {
                 },
                 .i2f => try self.wideNarrowToFloat(false),
                 .u2f => try self.wideNarrowToFloat(true),
-                .add64 => try self.wideSignedBinary(std.math.add),
+                .add64 => {
+                    try self.wideSignedBinary(std.math.add);
+                    continue :dispatch try self.nextVig64Instruction();
+                },
                 .sub64 => try self.wideSignedBinary(std.math.sub),
                 .mul64 => try self.wideSignedBinary(std.math.mul),
                 .add64_wrap => try self.wideUnsignedBinary(.add),
@@ -1230,10 +1257,27 @@ pub const VM = struct {
                 },
                 .jmp64 => try self.wideJump64(null),
                 .jmp_zero64 => try self.wideJump64(false),
-                .jmp_not_zero64 => try self.wideJump64(true),
+                .jmp_not_zero64 => {
+                    try self.wideJump64(true);
+                    continue :dispatch try self.nextVig64Instruction();
+                },
             }
         }
-        return error.SegmentFault;
+    }
+
+    /// Fetch and decode the instruction at the instruction pointer, and step over
+    /// its opcode byte.
+    ///
+    /// Running past the end of the code region is a fault: a program stops with
+    /// `halt`, and control that reaches the end has left the code the verifier
+    /// walked.
+    fn nextVig64Instruction(self: *VM) !bytecode.OpCode {
+        if (self.ip >= self.code_len) return error.SegmentFault;
+        const op = bytecode.OpCode.fromByte(self.memory[self.ip]) catch
+            return error.InvalidInstruction;
+        self.stats.record(op);
+        self.ip += 1;
+        return op;
     }
 
     fn pushWide(self: *VM, value: u64) !void {
