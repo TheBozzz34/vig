@@ -287,6 +287,13 @@ pub const VM = struct {
         const image = try container.parseVig64(program);
         if (image.imageLen() > self.memory.len) return error.ProgramTooLarge;
         if (image.header.entry_point > std.math.maxInt(usize)) return error.ProgramTooLarge;
+
+        // One mark for each byte of the code, then the same walk a VIG32
+        // container gets. The marks also stay for the run: `call_indirect` reads
+        // them to check a function that only a value names.
+        try self.growVerifyScratch(image.code.len);
+        try self.verifyVig64Image(image);
+
         try self.loadWideForeignImports(image);
         @memcpy(self.memory[0..image.code.len], image.code);
         @memcpy(self.memory[image.code.len..][0..image.data.len], image.data);
@@ -973,8 +980,8 @@ pub const VM = struct {
                     self.ip += 8;
                     try self.wideCall(target);
                 },
-                .call_indirect => try self.wideCall(try self.popWide()),
-                .jmp_indirect => try self.wideSetJump(try self.popWide()),
+                .call_indirect => try self.wideCall(try self.wideIndirectTarget()),
+                .jmp_indirect => try self.wideSetJump(try self.wideIndirectTarget()),
                 .ret => try self.wideReturn(false),
                 .ret_val => try self.wideReturn(true),
                 .enter => {
@@ -1267,6 +1274,21 @@ pub const VM = struct {
             if ((value != 0) != wanted) return;
         }
         try self.wideSetJump(target);
+    }
+
+    /// Take the target of a VIG64 indirect transfer off the stack and verify the
+    /// code it names.
+    ///
+    /// A direct `call64` or `jmp64` has a verified target already: the walk at load
+    /// time read the operand. This target was a value on the stack, so no read of
+    /// the code could find it, and it is checked here the first time control goes
+    /// to it. See `verifyIndirectTarget`.
+    fn wideIndirectTarget(self: *VM) !u64 {
+        const value = try self.popWide();
+        const target = std.math.cast(usize, value) orelse return error.SegmentFault;
+        if (target >= self.code_len) return error.SegmentFault;
+        try self.verifyIndirectTarget(target);
+        return value;
     }
 
     fn wideSetJump(self: *VM, target: u64) !void {
@@ -1891,7 +1913,7 @@ pub const VM = struct {
     /// `code` is the code region in guest memory rather than the slice of the
     /// container, because the container is gone once the program is loaded. The two
     /// hold the same bytes: the region is read-only for the whole run.
-    fn verifyOptions(self: *const VM, code: []const u8, entry_point: u32, import_count: u8) verify.Options {
+    fn verifyOptions(self: *const VM, code: []const u8, entry_point: u64, import_count: u8) verify.Options {
         return .{
             .code = code,
             .entry_point = entry_point,
@@ -1900,8 +1922,8 @@ pub const VM = struct {
             // Therefore an address in a `load` or a `store` operand, and a `store`
             // that would write an instruction, are both found before any of the
             // program runs.
-            .memory_size = @intCast(self.memory.len),
-            .code_len = @intCast(code.len),
+            .memory_size = self.memory.len,
+            .code_len = code.len,
         };
     }
 
@@ -1922,6 +1944,23 @@ pub const VM = struct {
     // Make sure that the code region is safe to execute before the VM runs any of
     // it. The vig-bytecode verifier gives the list of the checks.
     fn verifyImage(self: *VM, image: container.Image) !void {
+        var failure: verify.Failure = undefined;
+        const options = self.verifyOptions(
+            image.code,
+            image.header.entry_point,
+            image.header.import_count,
+        );
+        verify.verify(options, self.verify_scratch, &failure) catch |err| {
+            self.verification_failure = failure;
+            return err;
+        };
+    }
+
+    // The same checks for a VIG64 container. The verifier decodes the VIG64
+    // instructions and follows their wide branch targets, so a VIG64 program is
+    // refused before it runs for the same reasons a VIG32 one is. Skipping this
+    // would leave the newer ABI the only one that runs unchecked.
+    fn verifyVig64Image(self: *VM, image: container.Vig64Image) !void {
         var failure: verify.Failure = undefined;
         const options = self.verifyOptions(
             image.code,
@@ -2002,7 +2041,7 @@ pub const VM = struct {
     /// checked, and the marks from load time say whether an earlier transfer already
     /// checked it. The code cannot change while the program runs, so the answer is
     /// the one that a check before the run would have given.
-    fn verifyIndirectTarget(self: *VM, target: u32) !void {
+    fn verifyIndirectTarget(self: *VM, target: usize) !void {
         // The common case: an address that some path already decoded. The verifier
         // answers this from one mark, but the call is not free, and an indirect call
         // is an instruction in a loop as often as any other.
@@ -2013,7 +2052,7 @@ pub const VM = struct {
             self.memory[0..self.code_len],
             // The entry point is not read by `verifyFrom`, which starts at `target`.
             0,
-            @intCast(self.foreign_import_count),
+            @intCast(if (self.execution_abi == .vig64) self.wide_foreign_import_count else self.foreign_import_count),
         );
         verify.verifyFrom(options, self.verify_scratch, target, &failure) catch |err| {
             // The failure names the instruction that the verifier refused, which is
@@ -2341,6 +2380,84 @@ test "a VIG64 container invokes a typed foreign import" {
     try harness.vm.loadProgram(program[0..size]);
     try harness.vm.run();
     try std.testing.expect(harness.vm.wide_stack[0] > 0);
+}
+
+test "a VIG64 container is verified before it runs" {
+    // `jmp64` names a target that no instruction begins at, so a path would decode
+    // the operand bytes of the jump itself as an opcode. This is the check that a
+    // VIG32 container has had all along, on the wide branch instead of the narrow
+    // one: the verifier follows a `code_target64` the same way it follows a
+    // `code_target`.
+    var code: [10]u8 = undefined;
+    code[0] = opByte(.jmp64);
+    std.mem.writeInt(u64, code[1..9], 3, .little);
+    code[9] = opByte(.halt);
+    var program: [128]u8 = undefined;
+    const size = try container.writeVig64(.{ .code = &code }, &program);
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    try std.testing.expectError(error.MisalignedTarget, harness.vm.loadProgram(program[0..size]));
+    try std.testing.expectEqual(@as(usize, 0), harness.vm.verification_failure.?.offset);
+}
+
+test "a VIG64 store into the code region is refused at load time" {
+    var code: [11]u8 = undefined;
+    code[0] = opByte(.push64);
+    std.mem.writeInt(i64, code[1..9], 7, .little);
+    code[9] = opByte(.store64);
+    // The operand is missing, so the instruction runs past the end of the region.
+    code[10] = opByte(.halt);
+    var program: [160]u8 = undefined;
+    const truncated = try container.writeVig64(.{ .code = &code }, &program);
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    try std.testing.expectError(error.TruncatedInstruction, harness.vm.loadProgram(program[0..truncated]));
+
+    // A whole `store64` whose address is inside the code region would rewrite an
+    // instruction, which would make the rest of the verification untrue.
+    var whole: [19]u8 = undefined;
+    whole[0] = opByte(.push64);
+    std.mem.writeInt(i64, whole[1..9], 7, .little);
+    whole[9] = opByte(.store64);
+    std.mem.writeInt(u64, whole[10..18], 0, .little);
+    whole[18] = opByte(.halt);
+    const size = try container.writeVig64(.{ .code = &whole }, &program);
+    try std.testing.expectError(error.StoreIntoCodeRegion, harness.vm.loadProgram(program[0..size]));
+}
+
+test "a VIG64 indirect call verifies the function it reaches" {
+    // `_start` calls a function that no instruction names, so the walk at load time
+    // cannot reach it and the check happens at the call. The function here ends in a
+    // byte that no opcode has.
+    var code: [15]u8 = undefined;
+    code[0] = opByte(.push64);
+    std.mem.writeInt(i64, code[1..9], 10, .little);
+    code[9] = opByte(.call_indirect);
+    code[10] = opByte(.halt);
+    code[11] = opByte(.halt);
+    code[12] = opByte(.halt);
+    code[13] = opByte(.halt);
+    code[14] = 0xfe;
+    var program: [160]u8 = undefined;
+    const size = try container.writeVig64(.{ .code = &code, .entry_point = 0 }, &program);
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    // The program loads: the bad byte is not on any path the operands name.
+    try harness.vm.loadProgram(program[0..size]);
+
+    // Reaching it through a value is refused, and the target itself was fine.
+    var reachable: [15]u8 = undefined;
+    @memcpy(&reachable, &code);
+    std.mem.writeInt(i64, reachable[1..9], 14, .little);
+    const bad = try container.writeVig64(.{ .code = &reachable, .entry_point = 0 }, &program);
+    try harness.vm.loadProgram(program[0..bad]);
+    try std.testing.expectError(error.UnknownOpcode, harness.vm.run());
 }
 
 fn opByte(code: bytecode.OpCode) u8 {
