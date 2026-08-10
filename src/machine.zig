@@ -8,6 +8,79 @@ const container = bytecode.container;
 const verify = bytecode.verify;
 const Io = std.Io;
 
+/// Whether this build counts the instructions it runs. See the `stats` option in
+/// `build.zig`: the count costs time in the loop that runs them, so a VM that
+/// anyone ships is built without it and the counters below compile to nothing.
+const count_instructions = @import("build_options").stats;
+
+/// How many times each opcode ran, and how many instructions in total.
+///
+/// This is what says where a program spends itself, in the terms the interpreter
+/// works in: an opcode near the top of the report is a handler worth making
+/// faster, and one absent from it is a handler no measurement will notice. The
+/// structure is empty in a build that does not count, so a VM that does not
+/// measure carries no space for it either.
+pub const Stats = if (count_instructions) struct {
+    total: u64 = 0,
+    per_opcode: [256]u64 = @splat(0),
+
+    fn record(self: *Stats, op: bytecode.OpCode) void {
+        self.total += 1;
+        self.per_opcode[@intFromEnum(op)] += 1;
+    }
+
+    /// Write the report: the totals, then each opcode that ran, most first.
+    pub fn write(self: *const Stats, writer: *Io.Writer, elapsed_ns: u64) !void {
+        const seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
+        try writer.print("instructions: {d}\n", .{self.total});
+        try writer.print("seconds: {d:.6}\n", .{seconds});
+        if (seconds > 0) {
+            const rate = @as(f64, @floatFromInt(self.total)) / seconds / 1_000_000.0;
+            try writer.print("Minst/s: {d:.1}\n", .{rate});
+            const each = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(@max(self.total, 1)));
+            try writer.print("ns/instruction: {d:.2}\n", .{each});
+        }
+
+        // Sorted by count, because the question this answers is which handler to
+        // look at first and the answer is the top of the list.
+        var order: [256]u8 = undefined;
+        for (&order, 0..) |*slot, index| slot.* = @intCast(index);
+        const Sort = struct {
+            counts: *const [256]u64,
+            fn greater(context: @This(), a: u8, b: u8) bool {
+                return context.counts[a] > context.counts[b];
+            }
+        };
+        std.mem.sort(u8, &order, Sort{ .counts = &self.per_opcode }, Sort.greater);
+
+        try writer.writeAll("\n     count   share  opcode\n");
+        for (order) |byte| {
+            const count = self.per_opcode[byte];
+            if (count == 0) continue;
+            const share = 100.0 * @as(f64, @floatFromInt(count)) /
+                @as(f64, @floatFromInt(@max(self.total, 1)));
+            const name = if (bytecode.OpCode.fromByte(byte)) |op|
+                op.mnemonic()
+            else |_|
+                "?";
+            try writer.print("{d:>10}  {d:>5.1}%  {s}\n", .{ count, share, name });
+        }
+    }
+} else struct {
+    fn record(self: *Stats, op: bytecode.OpCode) void {
+        _ = self;
+        _ = op;
+    }
+
+    /// Nothing to report, so that a caller needs no test for which build this is.
+    /// `--stats` is refused before it reaches here.
+    pub fn write(self: *const Stats, writer: *Io.Writer, elapsed_ns: u64) !void {
+        _ = self;
+        _ = writer;
+        _ = elapsed_ns;
+    }
+};
+
 const ExecutionAbi = enum { vig32, vig64 };
 
 /// What the VM must remember about one active call.
@@ -126,6 +199,9 @@ pub const VM = struct {
     // The registers.
     ip: usize = 0, // the instruction pointer
     sp: usize = 0, // the stack pointer
+
+    /// What ran, in a build that counts. See `Stats`.
+    stats: Stats = .{},
 
     // Working space for the bytecode verifier: one mark for each byte of the code
     // region.
@@ -318,6 +394,7 @@ pub const VM = struct {
                 std.debug.print("Invalid OpCode 0x{x:0>2} at code offset {d}\n", .{ raw_op, self.ip });
                 return error.InvalidInstruction;
             };
+            self.stats.record(op);
             self.ip += 1;
 
             // Select the operation for this opcode.
@@ -838,6 +915,8 @@ pub const VM = struct {
                 .jmp_zero64,
                 .jmp_not_zero64,
                 .call64,
+                .load_local32,
+                .store_local32,
                 => return error.UnsupportedInstruction,
             }
         }
@@ -848,6 +927,7 @@ pub const VM = struct {
     fn runVig64(self: *VM) !void {
         while (self.ip < self.code_len) {
             const op = bytecode.OpCode.fromByte(self.memory[self.ip]) catch return error.InvalidInstruction;
+            self.stats.record(op);
             self.ip += 1;
             switch (op) {
                 .halt => return,
@@ -999,6 +1079,24 @@ pub const VM = struct {
                     self.ip += 2;
                     const at = try self.wideLocalAddress(index);
                     try self.pushWide(std.mem.readInt(u64, self.memory[at..][0..8], .little));
+                },
+                // The four-byte slot, which is what a C `int' local is. The sign
+                // is extended so that the value means the same number as it would
+                // through `local_addr` and `load32`, which is what these replace.
+                .load_local32 => {
+                    if (self.code_len - self.ip < 2) return error.SegmentFault;
+                    const index = std.mem.readInt(u16, self.memory[self.ip..][0..2], .little);
+                    self.ip += 2;
+                    const at = try self.wideLocalAddress(index);
+                    try self.pushNarrow(std.mem.readInt(i32, self.memory[at..][0..4], .little));
+                },
+                .store_local32 => {
+                    if (self.code_len - self.ip < 2) return error.SegmentFault;
+                    const index = std.mem.readInt(u16, self.memory[self.ip..][0..2], .little);
+                    self.ip += 2;
+                    const value = try self.popNarrow();
+                    const at = try self.wideLocalAddress(index);
+                    std.mem.writeInt(i32, self.memory[at..][0..4], value, .little);
                 },
                 .store_local => {
                     if (self.code_len - self.ip < 2) return error.SegmentFault;
@@ -2380,6 +2478,60 @@ test "a VIG64 container invokes a typed foreign import" {
     try harness.vm.loadProgram(program[0..size]);
     try harness.vm.run();
     try std.testing.expect(harness.vm.wide_stack[0] > 0);
+}
+
+test "the 32-bit frame instructions reach four bytes of a slot and no more" {
+    // `store_local32` and `load_local32` are exactly `local_addr N` followed by
+    // `store32` or `load32`, in one instruction. What that means for a slot is
+    // tested here rather than assumed: the whole slot is filled with ones, four
+    // bytes of it are written, and then the slot is read both ways. A `load_local`
+    // must see the ones still in the high half, and a `load_local32` must see the
+    // four bytes it wrote, with their sign extended.
+    //
+    // A compiler that emitted `load_local` for a four-byte local would pass every
+    // test that only reads what it wrote through the same instruction. This is the
+    // one that would fail.
+    var code: [42]u8 = undefined;
+    code[0] = opByte(.call64);
+    std.mem.writeInt(u64, code[1..9], 10, .little);
+    code[9] = opByte(.halt);
+
+    code[10] = opByte(.enter);
+    std.mem.writeInt(u16, code[11..13], 0, .little); // no arguments
+    std.mem.writeInt(u16, code[13..15], 1, .little); // one local
+
+    code[15] = opByte(.push64);
+    std.mem.writeInt(i64, code[16..24], -1, .little);
+    code[24] = opByte(.store_local);
+    std.mem.writeInt(u16, code[25..27], 0, .little);
+
+    // A negative value, so the sign extension of the narrow load is visible.
+    code[27] = opByte(.push);
+    std.mem.writeInt(i32, code[28..32], -5, .little);
+    code[32] = opByte(.store_local32);
+    std.mem.writeInt(u16, code[33..35], 0, .little);
+
+    code[35] = opByte(.load_local);
+    std.mem.writeInt(u16, code[36..38], 0, .little);
+    code[38] = opByte(.load_local32);
+    std.mem.writeInt(u16, code[39..41], 0, .little);
+    code[41] = opByte(.halt);
+
+    var program: [160]u8 = undefined;
+    const size = try container.writeVig64(.{ .code = &code }, &program);
+
+    var harness = Harness.init();
+    defer harness.deinit();
+    harness.start();
+    try harness.vm.loadProgram(program[0..size]);
+    try harness.vm.run();
+
+    try std.testing.expectEqual(@as(usize, 2), harness.vm.sp);
+    // The high half kept the ones that `store_local` put there, and the low half
+    // holds what `store_local32` wrote.
+    try std.testing.expectEqual(@as(u64, 0xFFFFFFFF_FFFFFFFB), harness.vm.wide_stack[0]);
+    // And the narrow load extended the sign of those four bytes.
+    try std.testing.expectEqual(@as(i64, -5), @as(i64, @bitCast(harness.vm.wide_stack[1])));
 }
 
 test "a VIG64 container is verified before it runs" {

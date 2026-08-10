@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const bytecode = @import("vig_bytecode");
 const Io = std.Io;
 const machine = @import("machine.zig");
+const build_options = @import("build_options");
 const constants = @import("constants.zig");
 const utils = @import("utils.zig");
 
@@ -30,7 +31,8 @@ pub fn main(init: std.process.Init) !void {
     // runs in a few kilobytes and a compiled one does not, and the size is a property
     // of the program rather than of this build.
     var config: machine.Config = .{};
-    args = try takeMemoryOption(arena, args, &config);
+    var report: Report = .{};
+    args = try takeOptions(arena, args, &config, &report);
 
     const vm = try arena.create(machine.VM);
     vm.init(init.gpa, config, &stdin.interface, &stdout.interface) catch |err| {
@@ -101,6 +103,9 @@ pub fn main(init: std.process.Init) !void {
     );
     std.log.info("============= VM OUTPUT =============", .{});
 
+    // The monotonic clock, because a wall clock can step and the number here is
+    // a duration rather than a time of day.
+    const started = Io.Clock.awake.now(init.io);
     vm.run() catch |err| {
         // Flush the output first. Then the output of the program comes before
         // the error message on stderr.
@@ -119,35 +124,87 @@ pub fn main(init: std.process.Init) !void {
         }
         return err;
     };
+    const finished = Io.Clock.awake.now(init.io);
+    const elapsed: u64 = @intCast(@max(0, finished.nanoseconds - started.nanoseconds));
     try stdout.interface.flush();
 
     std.log.info("============= END OF OUTPUT =============", .{});
     std.log.info("VM execution completed successfully.", .{});
+
+    // The report goes to stdout rather than through `std.log`, because it is
+    // output a script reads and not a diagnostic a person skims. The marker line
+    // separates it from what the program printed.
+    if (report.wanted()) {
+        try stdout.interface.writeAll("--- vig report ---\n");
+        try stdout.interface.print(
+            "seconds: {d:.6}\n",
+            .{@as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s},
+        );
+        if (report.stats) try vm.stats.write(&stdout.interface, elapsed);
+        try stdout.interface.flush();
+    }
 }
 
 /// The command line, in the form that `std.process.Init` gives it.
 const Args = []const [:0]const u8;
 
-/// Read a `--memory <size>` option off the front of `args` and give back the rest.
+/// What to write about the run after it finishes.
 ///
-/// The size is a number of bytes, and a `K` or an `M` suffix multiplies it. Nobody
-/// wants to write 1048576, and a VM that a person sizes by hand is the point of the
-/// option.
-fn takeMemoryOption(allocator: std.mem.Allocator, args: Args, config: *machine.Config) !Args {
-    if (args.len < 3 or !std.mem.eql(u8, args[1], "--memory")) return args;
+/// `--time` costs two reads of a clock and is in every build. `--stats` needs a
+/// build that counts the instructions, because that count is paid for inside the
+/// loop that runs them.
+const Report = struct {
+    time: bool = false,
+    stats: bool = false,
 
-    config.memory_size = parseSize(args[2]) catch {
-        std.log.err("--memory takes a size, for example 65536, 512K or 4M", .{});
-        return error.InvalidArguments;
-    };
+    fn wanted(self: Report) bool {
+        return self.time or self.stats;
+    }
+};
 
-    // The first argument is the name of the program, and the two that this option
-    // used are gone. Therefore the rest is what a caller with no option would have,
-    // and every check after this one reads it without knowing about the option.
-    const rest = try allocator.alloc([:0]const u8, args.len - 2);
-    rest[0] = args[0];
-    @memcpy(rest[1..], args[3..]);
-    return rest;
+/// Read the options off the front of `args` and give back the rest.
+///
+/// One loop rather than one function for each option, so that `--memory 4M
+/// --stats` and `--stats --memory 4M` mean the same thing. Every check after this
+/// reads a command line that had no options at all.
+fn takeOptions(
+    allocator: std.mem.Allocator,
+    args: Args,
+    config: *machine.Config,
+    report: *Report,
+) !Args {
+    var rest: std.ArrayList([:0]const u8) = .empty;
+    try rest.append(allocator, args[0]);
+
+    var index: usize = 1;
+    while (index < args.len) : (index += 1) {
+        const argument = args[index];
+        if (std.mem.eql(u8, argument, "--memory")) {
+            if (index + 1 == args.len) {
+                std.log.err("--memory takes a size, for example 65536, 512K or 4M", .{});
+                return error.InvalidArguments;
+            }
+            index += 1;
+            config.memory_size = parseSize(args[index]) catch {
+                std.log.err("--memory takes a size, for example 65536, 512K or 4M", .{});
+                return error.InvalidArguments;
+            };
+        } else if (std.mem.eql(u8, argument, "--time")) {
+            report.time = true;
+        } else if (std.mem.eql(u8, argument, "--stats")) {
+            if (!build_options.stats) {
+                std.log.err(
+                    "This VIG counts no instructions. Build it with -Dstats for --stats.",
+                    .{},
+                );
+                return error.InvalidArguments;
+            }
+            report.stats = true;
+        } else {
+            try rest.append(allocator, argument);
+        }
+    }
+    return rest.items;
 }
 
 fn parseSize(text: []const u8) !usize {
@@ -184,6 +241,19 @@ fn disassembleFile(
         allocator,
         .limited(constants.maxProgramFileSize(config.memory_size) + 1),
     );
+    // A VIG64 container is a different on-disk version, so it is read by its own
+    // parser. The listing is the same either way: an instruction is decoded from
+    // the table that both ABIs share.
+    if (bytecode.container.isContainer(bytes) and bytes.len > 4 and
+        bytes[4] == bytecode.container.vig64_version)
+    {
+        const image = try bytecode.container.parseVig64(bytes);
+        var names: std.ArrayList([]const u8) = .empty;
+        var imports = image.importIterator();
+        while (try imports.next()) |import| try names.append(allocator, import.symbol);
+        return bytecode.disasm.writeVig64Image(writer, image, .{ .import_names = names.items });
+    }
+
     const image = try bytecode.container.parse(bytes);
 
     var names: std.ArrayList([]const u8) = .empty;

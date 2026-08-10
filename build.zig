@@ -7,6 +7,19 @@ pub fn build(b: *std.Build) void {
 
     const ffi = libffi.build(b, target, optimize);
 
+    // Counting instructions costs time in the loop that runs them, so it is a
+    // build option and not a flag: a VM that anyone ships must not pay for it.
+    // `zig build install -Doptimize=ReleaseFast -Dstats` gives the one to measure
+    // with, and `vig --stats <program>` then writes the report.
+    const stats = b.option(
+        bool,
+        "stats",
+        "Count the instructions a program runs and report them per opcode",
+    ) orelse false;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "stats", stats);
+    const build_options_module = build_options.createModule();
+
     // The VM shares the opcodes, the container format and the verifier with the
     // assembler. This build does not make them again.
     const bytecode_package = b.dependency("vig_bytecode", .{
@@ -51,7 +64,10 @@ pub fn build(b: *std.Build) void {
             // device.
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "vig_bytecode", .module = bytecode }},
+            .imports = &.{
+                .{ .name = "vig_bytecode", .module = bytecode },
+                .{ .name = "build_options", .module = build_options_module },
+            },
         }),
     });
     libffi.link(exe.root_module, ffi);
@@ -95,6 +111,7 @@ pub fn build(b: *std.Build) void {
     for (test_roots) |root| {
         var imports: std.ArrayList(std.Build.Module.Import) = .empty;
         imports.append(b.allocator, .{ .name = "vig_bytecode", .module = bytecode }) catch @panic("OOM");
+        imports.append(b.allocator, .{ .name = "build_options", .module = build_options_module }) catch @panic("OOM");
         if (root.needs_assembler) {
             imports.append(b.allocator, .{ .name = "vig_assembler", .module = assembler }) catch @panic("OOM");
         }
