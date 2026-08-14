@@ -1,0 +1,7 @@
+exports_files([
+    "configure.bzl",
+    "empty.zig",
+    "fficonfig.h.in",
+    "libffi.BUILD.bazel",
+])
+

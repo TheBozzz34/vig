@@ -6,6 +6,21 @@ Programs can be written in a simplified assembly language, assembled via vigasm,
 The instruction set, container format, and the bytecode verifier live in
 [vig-bytecode](https://github.com/TheBozzz34/vig-bytecode)
 
+## Building with Bazel
+
+```powershell
+bazelisk build //:vig //:vig_stats
+bazelisk test //...
+bazel-bin\vig.exe program.vig
+```
+
+Bazel builds the vendored libffi 3.5.2 sources, translates its C API for Zig,
+and links it into both VM variants. `//:vig_stats` enables per-opcode instruction
+counting for benchmarks; the normal `//:vig` target has no counting overhead.
+
+The first build downloads the exact Zig nightly named in `MODULE.bazel`. On
+Windows, Git Bash is used for the small shell actions required by `rules_zig`.
+
 ## Loading a program
 
 A program file a has this structure: a header recording the code length, the

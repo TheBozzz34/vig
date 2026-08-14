@@ -1,0 +1,26 @@
+#ifndef LIBFFI_CONFIG_H
+#define LIBFFI_CONFIG_H
+#define HAVE_LONG_DOUBLE 1
+#define STDC_HEADERS 1
+#define HAVE_INTTYPES_H 1
+#define HAVE_STDINT_H 1
+#define HAVE_STRING_H 1
+@PLATFORM_DEFINES@
+#ifdef HAVE_HIDDEN_VISIBILITY_ATTRIBUTE
+#ifdef LIBFFI_ASM
+#ifdef __APPLE__
+#define FFI_HIDDEN(name) .private_extern name
+#else
+#define FFI_HIDDEN(name) .hidden name
+#endif
+#else
+#define FFI_HIDDEN __attribute__ ((visibility ("hidden")))
+#endif
+#else
+#ifdef LIBFFI_ASM
+#define FFI_HIDDEN(name)
+#else
+#define FFI_HIDDEN
+#endif
+#endif
+#endif

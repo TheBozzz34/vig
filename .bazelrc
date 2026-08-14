@@ -1,0 +1,4 @@
+common --enable_platform_specific_config
+build:windows --sandbox_add_mount_pair=C:\\Temp
+build:windows --shell_executable="C:/Program Files/Git/bin/bash.exe"
+build:windows --enable_runfiles

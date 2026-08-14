@@ -1,0 +1,6 @@
+exports_files([
+    "build_options.zig",
+    "build_options_stats.zig",
+    "example_options.zig",
+])
+

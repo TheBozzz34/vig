@@ -1,0 +1,256 @@
+load(
+    "@rules_zig//zig:defs.bzl",
+    "zig_binary",
+    "zig_c_library",
+    "zig_library",
+    "zig_static_library",
+    "zig_test",
+)
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("//bazel/libffi:configure.bzl", "configure_libffi", "copy_file")
+
+package(default_visibility = ["//visibility:public"])
+
+ZIG_SRCS = glob(["src/*.zig"])
+
+config_setting(
+    name = "x86_64_windows",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:windows",
+    ],
+)
+
+config_setting(
+    name = "x86_64_linux",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+config_setting(
+    name = "x86_64_macos",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:macos",
+    ],
+)
+
+config_setting(
+    name = "x86",
+    constraint_values = ["@platforms//cpu:x86_32"],
+)
+
+config_setting(
+    name = "aarch64",
+    constraint_values = ["@platforms//cpu:aarch64"],
+)
+
+config_setting(
+    name = "arm",
+    constraint_values = ["@platforms//cpu:arm"],
+)
+
+configure_libffi(
+    name = "configure_libffi",
+    ffi_h = "ffi.h",
+    ffi_template = "@libffi//:include/ffi.h.in",
+    fficonfig_h = "fficonfig.h",
+    fficonfig_template = "//bazel/libffi:fficonfig.h.in",
+    platform_defines = select({
+        ":x86_64_linux": "#define HAVE_MEMFD_CREATE 1\n#define HAVE_SYS_MEMFD_H 1\n#define FFI_EXEC_STATIC_TRAMP 1\n#define HAVE_AS_X86_PCREL 1",
+        ":x86_64_macos": "#define HAVE_ALLOCA_H 1\n#define HAVE_HIDDEN_VISIBILITY_ATTRIBUTE 1\n#define HAVE_MMAP 1\n#define HAVE_MPROTECT 1\n#define FFI_MMAP_EXEC_WRIT 1\n#define HAVE_AS_X86_PCREL 1",
+        ":x86_64_windows": "#define HAVE_MMAP 1\n#define HAVE_MPROTECT 1\n#define FFI_MMAP_EXEC_WRIT 1\n#define HAVE_AS_X86_PCREL 1",
+        "//conditions:default": "",
+    }),
+    target = select({
+        ":aarch64": "AARCH64",
+        ":arm": "ARM",
+        ":x86": "X86",
+        ":x86_64_windows": "X86_WIN64",
+        "//conditions:default": "X86_64",
+    }),
+)
+
+copy_file(
+    name = "copy_ffitarget_h",
+    src = select({
+        ":aarch64": "@libffi//:src/aarch64/ffitarget.h",
+        ":arm": "@libffi//:src/arm/ffitarget.h",
+        ":x86": "@libffi//:src/x86/ffitarget.h",
+        "//conditions:default": "@libffi//:src/x86/ffitarget.h",
+    }),
+    out = "ffitarget.h",
+)
+
+zig_static_library(
+    name = "libffi",
+    copts = [
+        "-I$(execpath :ffi.h)/..",
+        "-I$(execpath :fficonfig.h)/..",
+        "-I$(execpath :ffitarget.h)/..",
+        "-I$(execpath @libffi//:include/ffi_common.h)/..",
+    ] + select({
+        ":x86_64_windows": [],
+        "//conditions:default": ["-fvisibility=hidden"],
+    }),
+    csrcs = [
+        "@libffi//:src/closures.c",
+        "@libffi//:src/prep_cif.c",
+        "@libffi//:src/tramp.c",
+        "@libffi//:src/types.c",
+    ] + select({
+        ":aarch64": [
+            "@libffi//:src/aarch64/ffi.c",
+            "@libffi//:src/aarch64/sysv.S",
+        ],
+        ":arm": [
+            "@libffi//:src/arm/ffi.c",
+            "@libffi//:src/arm/sysv.S",
+        ],
+        ":x86": [
+            "@libffi//:src/x86/ffi.c",
+            "@libffi//:src/x86/sysv.S",
+        ],
+        ":x86_64_windows": [
+            "@libffi//:src/x86/ffiw64.c",
+            "@libffi//:src/x86/win64.S",
+        ],
+        "//conditions:default": [
+            "@libffi//:src/x86/ffi64.c",
+            "@libffi//:src/x86/ffiw64.c",
+            "@libffi//:src/x86/unix64.S",
+            "@libffi//:src/x86/win64.S",
+        ],
+    }),
+    data = [
+        ":ffi.h",
+        ":fficonfig.h",
+        ":ffitarget.h",
+        "@libffi//:include/ffi_common.h",
+    ],
+    extra_srcs = [
+        ":ffi.h",
+        ":fficonfig.h",
+        ":ffitarget.h",
+        "@libffi//:include/ffi_common.h",
+    ],
+    linkopts = ["-lc"],
+    main = "//bazel/libffi:empty.zig",
+    zigopts = ["-lc"],
+)
+
+cc_library(
+    name = "ffi_headers",
+    hdrs = [
+        ":ffi.h",
+        ":ffitarget.h",
+    ],
+    linkopts = ["-lc"],
+    strip_include_prefix = "/",
+    deps = [":libffi"],
+)
+
+zig_c_library(
+    name = "ffi",
+    cdeps = [":ffi_headers"],
+    import_name = "ffi",
+)
+
+zig_library(
+    name = "build_options",
+    import_name = "build_options",
+    main = "//bazel:build_options.zig",
+)
+
+zig_library(
+    name = "build_options_stats",
+    import_name = "build_options",
+    main = "//bazel:build_options_stats.zig",
+)
+
+zig_library(
+    name = "example_options",
+    import_name = "example_options",
+    main = "//bazel:example_options.zig",
+)
+
+zig_binary(
+    name = "vig",
+    srcs = ZIG_SRCS,
+    deps = [
+        ":build_options",
+        ":ffi",
+        "@vig_bytecode//:vig_bytecode",
+    ],
+    main = "src/main.zig",
+)
+
+zig_binary(
+    name = "vig_stats",
+    srcs = ZIG_SRCS,
+    deps = [
+        ":build_options_stats",
+        ":ffi",
+        "@vig_bytecode//:vig_bytecode",
+    ],
+    main = "src/main.zig",
+)
+
+[
+    zig_test(
+        name = test_name,
+        srcs = ZIG_SRCS,
+        deps = [
+            ":build_options",
+            ":ffi",
+            "@vig_bytecode//:vig_bytecode",
+        ],
+        main = source,
+    )
+    for test_name, source in {
+        "foreign_test": "src/foreign.zig",
+        "machine_test": "src/machine.zig",
+        "main_test": "src/main.zig",
+        "utils_test": "src/utils.zig",
+    }.items()
+]
+
+zig_test(
+    name = "toolchain_test",
+    srcs = ZIG_SRCS,
+    deps = [
+        ":build_options",
+        ":ffi",
+        "@vig_assembler//:vig_assembler",
+        "@vig_bytecode//:vig_bytecode",
+    ],
+    main = "src/toolchain_tests.zig",
+)
+
+zig_test(
+    name = "example_test",
+    srcs = ZIG_SRCS,
+    data = ["@vig_assembler//:examples"],
+    deps = [
+        ":build_options",
+        ":example_options",
+        ":ffi",
+        "@vig_assembler//:vig_assembler",
+        "@vig_bytecode//:vig_bytecode",
+    ],
+    main = "src/example_tests.zig",
+)
+
+test_suite(
+    name = "tests",
+    tests = [
+        ":example_test",
+        ":foreign_test",
+        ":machine_test",
+        ":main_test",
+        ":toolchain_test",
+        ":utils_test",
+    ],
+)
