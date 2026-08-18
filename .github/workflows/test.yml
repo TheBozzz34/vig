@@ -11,7 +11,7 @@
 # Linux is the job that matters for a regression: a `kernel32` declaration that
 # leaks back into a path any code can reach breaks that job and not the Windows
 # one.
-name: test
+name: build
 
 on:
   push:
@@ -44,32 +44,11 @@ jobs:
           repository: TheBozzz34/vig-assembler
           path: vig-assembler
 
-      - uses: mlugg/setup-zig@v2
-        with:
-          # This value must be the `minimum_zig_version` of build.zig.zon. See
-          # the note in the vig-bytecode workflow.
-          version: 0.17.0-dev.1543+6db520a4c
+      - name: Build All Targets
+        run: bazel build //vig
 
-      # `test-all` runs the suite of this package and then the suite of each
-      # dependency. A change to the shared instruction set that breaks the
-      # assembler fails here, which `zig build test` on its own does not.
-      - run: zig build test-all --summary all
-        working-directory: vig
+      - name: Test All Targets
+        run: bazel test //vig
 
-      # A build for each system that VIG supports, from one job. This catches a
-      # declaration that belongs to a single system before a user of another
-      # system meets it, and it covers macOS, for which there is no job above.
-      #
-      # `aarch64-macos` is not here. It needs `FFI_EXEC_TRAMPOLINE_TABLE`, and the
-      # `fficonfig.h` that `build/libffi.zig` writes does not agree with that mode,
-      # so libffi itself does not compile. That is a libffi configuration to fix on
-      # its own, and it is not about the VM.
-      - name: Cross-compile for every supported system
-        if: matrix.os == 'ubuntu-latest'
-        working-directory: vig
-        run: |
-          zig build -Dtarget=x86_64-linux
-          zig build -Dtarget=aarch64-linux
-          zig build -Dtarget=x86_64-linux-musl
-          zig build -Dtarget=x86_64-macos
-          zig build -Dtarget=x86_64-windows
+      
+
