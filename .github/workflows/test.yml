@@ -45,10 +45,10 @@ jobs:
           path: vig-assembler
 
       - name: Build All Targets
-        run: bazel build //vig
+        run: bazel build //:vig
 
       - name: Test All Targets
-        run: bazel test //vig
+        run: bazel test //:vig
 
       
 
