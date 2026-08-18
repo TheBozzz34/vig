@@ -2,8 +2,105 @@ const bytecode = @import("vig_bytecode");
 const constants = @import("constants.zig");
 const machine = @import("machine.zig");
 const std = @import("std");
+const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+const Ed25519 = std.crypto.sign.Ed25519;
 
 const Io = std.Io;
+
+pub const AGM2Header = extern struct {
+    magic: [4]u8,
+    version: u8,
+    flags: u8,
+    header_len: u16,
+    aes_key_id: u32,
+    signing_key_id: u32,
+    aad_len: u32,
+    ciphertext_len: u64,
+    nonce: [12]u8,
+};
+
+pub const AGM2FileView = struct {
+    header: AGM2Header,
+    aad: []const u8,
+    ciphertext: []const u8,
+    signature: [64]u8,
+};
+
+pub fn parseAGM2File(bytes: []const u8) !AGM2FileView {
+    // Ensure the data has at least the minimal header and file size
+    if (bytes.len < 40 + 64) return error.MalformedFile;
+
+    // Parse header, all fixed bytes
+    const header_bytes = bytes[0..40];
+    const header: AGM2Header = @bitCast(header_bytes.*);
+
+    // Ensure this is actually an AGM2 file
+    if (!std.mem.eql(u8, &header.magic, "AGM2")) return error.InvalidMagic;
+
+    // Slice out the dynamic length portions based on header fields
+    const aad_start = 40;
+    const aad_end = aad_start + header.aad_len;
+
+    // Assumes ciphertext_len includes the 16-byte GCM tag
+    const crypto_end = aad_end + header.ciphertext_len;
+    const sig_end = crypto_end + 64;
+
+    if (bytes.len < sig_end) return error.UnexpectedEOF;
+
+    return AGM2FileView{
+        .header = header,
+        .aad = bytes[aad_start..aad_end],
+        .ciphertext = bytes[aad_end..crypto_end],
+        .signature = bytes[crypto_end..sig_end].*,
+    };
+}
+
+pub fn verifyAndDecryptAGM2(
+    allocator: std.mem.Allocator,
+    file_view: AGM2FileView,
+    aes_key: [Aes256Gcm.key_length]u8,
+    public_key_bytes: [Ed25519.PublicKey.encoded_length]u8,
+) ![]u8 {
+    // 1. Reconstruct the Ed25519 PublicKey and Signature primitives
+    const public_key = try Ed25519.PublicKey.fromBytes(public_key_bytes);
+    const signature = Ed25519.Signature.fromBytes(file_view.signature);
+
+    // 2. Initialize a crypto verifier to hash the fields sequentially
+    // This assumes the signature covers the [Header + AAD + Ciphertext]
+    var verifier = Ed25519.Verifier.init();
+
+    // Feed the raw memory of the header
+    const header_bytes = std.mem.asBytes(&file_view.header);
+    verifier.update(header_bytes);
+
+    // Feed the context data and the encrypted buffer
+    verifier.update(file_view.aad);
+    verifier.update(file_view.ciphertext);
+
+    // 3. Complete verification. Fails with error.SignatureVerificationFailed if tampered
+    try verifier.verify(signature, public_key);
+
+    // 4. Proceed to Decryption (Safe to do now that authenticity is proven)
+    if (file_view.ciphertext.len < Aes256Gcm.tag_length) return error.CiphertextTooShort;
+    const actual_ciphertext_len = file_view.ciphertext.len - Aes256Gcm.tag_length;
+
+    const encrypted_payload = file_view.ciphertext[0..actual_ciphertext_len];
+    const tag: [16]u8 = file_view.ciphertext[actual_ciphertext_len..][0..16].*;
+
+    const plaintext = try allocator.alloc(u8, actual_ciphertext_len);
+    errdefer allocator.free(plaintext);
+
+    try Aes256Gcm.decrypt(
+        plaintext,
+        encrypted_payload,
+        tag,
+        file_view.aad,
+        file_view.header.nonce,
+        aes_key,
+    );
+
+    return plaintext;
+}
 
 pub fn loadProgramFromFile(vm: *machine.VM, io: Io, allocator: std.mem.Allocator, path: []const u8) !void {
     // The VM removes the container header and the import table before the code
@@ -13,13 +110,17 @@ pub fn loadProgramFromFile(vm: *machine.VM, io: Io, allocator: std.mem.Allocator
     //
     // The limit comes from the VM, because the memory of a VM is now a value that
     // the caller chose and not a number this file knows.
-    const program = try std.Io.Dir.cwd().readFileAlloc(
+    const blob = try std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
         allocator,
         .limited(vm.maxProgramFileSize() + 1),
     );
-    defer allocator.free(program);
+    defer allocator.free(blob);
+
+    const AGMFile = parseAGM2File(blob);
+
+    const plaintext = verifyAndDecryptAGM2(allocator, AGMFile, aes_key: [?]u8, public_key_bytes: [?]u8)
 
     try vm.loadProgram(program);
 }
